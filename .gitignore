@@ -135,3 +135,7 @@ davinci-resolve-mcp-analysis/
 
 # CI managed-install handshake probe output
 handshake.jsonl
+
+# Local recovery indexes and analyzer reports.
+tools/file-analyzer/reports/
+tools/ableton-recovery/data/
