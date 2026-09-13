@@ -308,10 +308,25 @@ def _related_topics(record: Dict[str, Any], index: Dict[str, Dict[str, Any]]) ->
         topic = by_path.get(reference)
         if topic and topic != record["topic"] and topic not in related:
             related.append(topic)
-    for topic in sorted(index):
+
+    topic_names = sorted(index)
+    if not topic_names:
+        return related
+
+    topic_lookup = {name.lower(): name for name in topic_names}
+    alternation = "|".join(re.escape(name) for name in topic_names)
+    pattern = re.compile(rf"(?<!\w)(?:{alternation})(?!\w)", flags=re.IGNORECASE)
+    matches: set[str] = set()
+    for match in pattern.finditer(record["body"]):
+        candidate = match.group(0).lower()
+        canonical = topic_lookup.get(candidate)
+        if canonical:
+            matches.add(canonical)
+
+    for topic in topic_names:
         if topic == record["topic"] or topic in related:
             continue
-        if re.search(rf"\b{re.escape(topic)}\b", record["body"]):
+        if topic in matches:
             related.append(topic)
     return related
 
