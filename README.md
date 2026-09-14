@@ -2,10 +2,10 @@
 
 English | [简体中文](README.zh-CN.md)
 
-[![Version](https://img.shields.io/badge/version-2.212.1-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
+[![Version](https://img.shields.io/badge/version-4.1.3-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
 [![npm](https://img.shields.io/npm/v/davinci-resolve-mcp.svg?label=npm&color=CB3837)](https://www.npmjs.com/package/davinci-resolve-mcp)
 [![API Coverage](https://img.shields.io/badge/API%20Coverage-100%25-brightgreen.svg)](docs/reference/api-coverage.md)
-[![Tools](https://img.shields.io/badge/MCP%20Tools-36%20(353%20full)-blue.svg)](#server-modes)
+[![Tools](https://img.shields.io/badge/MCP%20Tools-37%20(387%20full)-blue.svg)](#server-modes)
 [![Advanced](https://img.shields.io/badge/Advanced%20(offline)-18%20tools-blueviolet.svg)](#server-modes)
 [![Tested](https://img.shields.io/badge/Live%20Tested-93.6%25-green.svg)](docs/reference/api-coverage.md#test-results)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-18.5+-darkred.svg)](https://www.blackmagicdesign.com/products/davinciresolve)
@@ -42,10 +42,14 @@ The installer and server check the latest GitHub release for MCP updates. Checks
 
 Blackmagic gates *external* scripting to Studio: on the free edition
 `scriptapp("Resolve")` refuses a foreign process, whatever the preference says.
-The **Workspace ▸ Scripts** menu is not gated — a script launched from it is
-handed the live `resolve` object on any edition — so the server can reach the
-free edition through a small script that runs *inside* Resolve and re-exports it
-over an authenticated loopback listener.
+Through Resolve 21.0.x the **Workspace ▸ Scripts** menu was not gated — a script
+launched from it is handed the live `resolve` object (measured on free 21.0.3.7) —
+so the server can reach the free edition through a small script that runs *inside*
+Resolve and re-exports it over an authenticated loopback listener. **Resolve 21.1
+moved Python scripting to Studio.** On free 21.1 the Scripts menu no longer lists
+`.py` files at all (reported on Fedora 44 in #203; a Lua script in the same folder
+lists normally). Whether the Console still runs Python there is unconfirmed, so
+treat the bridge as a 21.0.x path until that is measured.
 
 ```bash
 python scripts/install_resolve_bridge.py
@@ -128,8 +132,8 @@ The command starts a loopback-only server and opens the control panel in your br
 
 | Mode | Entry point | Tools | Best for |
 |------|-------------|-------|----------|
-| Compound | `src/server.py` | 36 | Default mode for most assistants. Related Resolve operations are grouped behind action parameters to keep context usage low. |
-| Full / granular | `src/server.py --full` or `src/resolve_mcp_server.py` | 353 | Power users who want one MCP tool per Resolve API method. |
+| Compound | `src/server.py` | 37 | Default mode for most assistants. Related Resolve operations are grouped behind action parameters to keep context usage low. |
+| Full / granular | `src/server.py --full` or `src/resolve_mcp_server.py` | 387 | Power users who want one MCP tool per Resolve API method. |
 
 The compound server is recommended unless you specifically need the granular one-tool-per-method surface.
 
@@ -298,13 +302,60 @@ and an audit document is the last place to let a reader read it as an all-clear.
 
 Traces live in a 100-entry in-memory ring and are appended to
 `logs/execution-traces.jsonl` beside `server.log` — `RESOLVE_MCP_TRACE_FILE`
-moves it. `list_recent_executions` reports that path and whether it is
+moves it, and `RESOLVE_MCP_LOG_FILE` moves `server.log` itself (a path, or empty
+for no file; the offline test suite points it at a temporary file so it never
+writes into the operator's log). `list_recent_executions` reports that path and whether it is
 writable, so "the log is empty" and "nothing is being written" are
 distinguishable without reading the source. What is recorded is tool name,
 action, timing, status, semantic deltas and verification — no parameters and no
 file paths. The one free-text field is the `request` you pass to
 `begin_execution`, so treat it the way you would a commit message on a client
 project.
+
+## Verified-Trap Guard
+
+`src/utils/api_truth.py` records behaviours of the Resolve API that were measured
+against a live build rather than read off a signature — calls that return `True`
+having done nothing, settings keys silently rejected, methods that are not there
+at all. That ledger used to be **pull-only**: it answered
+`resolve_control(action="api_truth")` and was otherwise a file nobody greps in
+the middle of a job.
+
+It now reaches the caller at the callsite. An action mapped to a symbol with a
+recorded fact carries a compact `known_limitation` on its result — symbol,
+reality, recommendation, and nothing else, because response weight is a real cost
+on a long grading session and the full entry is one lookup away.
+
+A fact is only attached when the mapping names that exact symbol. Nothing is
+inferred from a similar name: an unrelated explanation stapled to a failure reads
+as a diagnosis, and a wrong diagnosis is worse than none.
+
+**One behaviour refuses rather than warns.** `TimelineItem.CopyGrades` replaces
+the target's grade wholesale — measured by baking each state to a 33-point LUT
+and comparing bytes — returns `True` while doing it, and creates no version to go
+back to. Applied to clips carrying hand-work, that is unrecoverable loss reported
+as success. So actions that call it refuse until the caller passes
+`acknowledge_trap: true`:
+
+```json
+{
+  "success": false,
+  "error": "'timeline_item_color.copy_grades' is refused: its verified behaviour destroys existing work that cannot be recovered afterwards.",
+  "known_limitation": [{"symbol": "TimelineItem.CopyGrades", "reality": "...", "recommended": "..."}],
+  "retry_with": {"acknowledge_trap": true}
+}
+```
+
+The intent is not to forbid the operation — it is to make the caller say out loud
+that they know what it does. Dry runs are exempt: a preview destroys nothing.
+
+Set `RESOLVE_MCP_DISABLE_TRAP_GUARD=1` to turn both the refusal and the advisory
+push off. This is a behaviour change for callers that previously received a bare
+`{"success": true}` from a destructive copy.
+
+Facts that power a refusal must stay re-measurable, so a live probe re-derives
+each one and records `drifted` when Resolve stops agreeing; a test fails if a
+`destroys_prior_work` entry has no probe.
 
 ## Optional Extras
 
@@ -339,7 +390,7 @@ cheaper to read it here than to discover it mid-project.
 | Not supported | Why, and what you get instead |
 |---|---|
 | **Choosing the best take** | Performance is most of what makes a take right, and none of it is measurable from a waveform or a transcript. `rank_takes` ranks *fluency* — fillers, restarts, script coverage — and says so in every response. The take that plays is regularly the least fluent one, because the hesitation is often the acting. Use it to find the clean safety take, not to choose the read. |
-| **Cutting to music** | No beat or downbeat detection yet. Speech-driven tools will read a music bed as one long region and are the wrong instrument for it. |
+| **Automatic music editing** | Optional `librosa` support provides beat detection and beat/bar/phrase cut-point plans, not a finished assembly. Downbeats are inferred from the first beat; use `beat_offset` for pickups. Speech-silence tools are unsuitable for finding musical edit points. |
 | **Judging a cut** | Nothing here has an opinion about whether an edit is good. Every destructive action is plan → review → confirm for that reason. |
 | **Replacing an editor** | The output is a first-pass assembly, in the assistant-editor sense: ingest, sync, organize, string out, flag problems. It is a starting point you cut, not a finished cut. Defaults are deliberately **generous** — a first assembly is supposed to run long, because trimming is fast and visible while recovering discarded material is slow and invisible. |
 | **Modifying your source media** | By design and without exception — see below. |
@@ -359,7 +410,7 @@ The default server is a local stdio process launched by your MCP client; it does
 
 | Metric | Value |
 |--------|-------|
-| MCP Tools | **36** compound / **353** granular (live server) |
+| MCP Tools | **37** compound / **387** granular (live server) |
 | Advanced (offline) tools | **18** — .drp/.drt/.drx + DB authoring, no Resolve running |
 | Kernel Actions | **136** guarded workflow actions across 9 compound tools |
 | API Methods Covered | **361/361** (100%) |
@@ -403,6 +454,17 @@ Extension authoring references live in [docs/authoring](docs/authoring/). Resolv
   instead.
 
 Resolve 19.1.3 remains the compatibility baseline. Resolve 20.x scripting calls are additive, version-guarded, and live-tested on 20.3.2. Resolve 21.0 scripting additions (audio classification, speaker-detection transcription, IntelliSearch, slate analysis, motion-deblur, speech generation, session background-task control) are exposed behind runtime capability detection, so they stay inert on older builds and activate automatically on Resolve 21+. They are live-tested on Studio 21.0.2.4 — see the [Resolve 21 delta](docs/reference/api-coverage.md#resolve-21-delta-detail). Note that `AnalyzeForIntellisearch`, `AnalyzeForSlate` and `GenerateSpeech` each require a separately-downloaded AI Extras pack, and Resolve reports a missing pack inconsistently (some return `False`, others an error string), so these actions report `success: false` with the Resolve-supplied reason rather than guessing.
+
+## Reporting Bugs and Requesting Features
+
+Tell your assistant "send this as a bug" or "send this as a feature request". It
+drafts a GitHub issue from the conversation, including the failing call and
+its error, and attaches the server version, Resolve build, connection mode and
+OS. Local paths, your username and anything that looks like a secret are
+redacted. Nothing is filed for you: you get a prefilled link, review the
+draft, and submit it on GitHub yourself. You can also
+[open an issue](https://github.com/samuelgursky/davinci-resolve-mcp/issues/new/choose)
+directly.
 
 ## Development
 
