@@ -191,19 +191,42 @@ def detect_entities(
             "note": f"No clusters of size >= {min_cluster_size} at threshold {threshold}.",
         }
 
-    # Hydrate frame rows once: frame_ref -> (clip_uuid, frame_index, path, shot_uuid).
-    frame_info: Dict[str, Dict[str, Any]] = {}
+    # Hydrate frame rows once: parse all frame_refs into (clip_uuid, frame_index) pairs.
+    frame_lookup: Dict[Tuple[str, int], Tuple[str, Any]] = {}  # (clip_uuid, frame_index) -> (frame_path, shot_uuid)
+    parsed_refs: List[Tuple[str, str, int]] = []  # (ref, clip_uuid, frame_index)
+    
     for ref in frame_refs:
-        clip_uuid, _, frame_index = ref.rpartition(":")
-        row = conn.execute(
-            "SELECT frame_path, shot_uuid FROM frames WHERE clip_uuid = ? AND frame_index = ?",
-            (clip_uuid, int(frame_index) if frame_index.lstrip("-").isdigit() else -1),
-        ).fetchone()
+        clip_uuid, _, frame_index_str = ref.rpartition(":")
+        frame_index = int(frame_index_str) if frame_index_str.lstrip("-").isdigit() else -1
+        parsed_refs.append((ref, clip_uuid, frame_index))
+    
+    # Batch-fetch all frames in one query using a UNION of conditions.
+    if parsed_refs:
+        # Build a list of (clip_uuid, frame_index) tuples for the batch query.
+        batch_params = parsed_refs
+        placeholders = ", ".join(["(?, ?)"] * len(batch_params))
+        flat_params = [item for pair in [(clip_uuid, frame_index) for _, clip_uuid, frame_index in batch_params] for item in pair]
+        
+        rows = conn.execute(
+            f"SELECT clip_uuid, frame_index, frame_path, shot_uuid FROM frames WHERE (clip_uuid, frame_index) IN ({placeholders})",
+            flat_params,
+        ).fetchall()
+        
+        for row in rows:
+            frame_lookup[(row["clip_uuid"], row["frame_index"])] = (
+                str(row["frame_path"]) if row["frame_path"] else None,
+                str(row["shot_uuid"]) if row["shot_uuid"] else None,
+            )
+    
+    # Build frame_info dict from batch results.
+    frame_info: Dict[str, Dict[str, Any]] = {}
+    for ref, clip_uuid, frame_index in parsed_refs:
+        frame_path, shot_uuid = frame_lookup.get((clip_uuid, frame_index), (None, None))
         frame_info[ref] = {
             "clip_uuid": clip_uuid,
-            "frame_index": frame_index,
-            "frame_path": str(row["frame_path"]) if row and row["frame_path"] else None,
-            "shot_uuid": str(row["shot_uuid"]) if row and row["shot_uuid"] else None,
+            "frame_index": str(frame_index),
+            "frame_path": frame_path,
+            "shot_uuid": shot_uuid,
         }
 
     # Caps: one frame per cluster goes to the host.
