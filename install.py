@@ -37,7 +37,7 @@ from src.utils.update_check import (
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION = "2.212.1"
+VERSION = "4.1.3"
 # Only hard floor: mcp[cli] requires Python 3.10+. There is no upper bound —
 # Resolve's scripting bridge loads into newer interpreters on recent builds
 # (Python 3.14 verified against Resolve Studio 20.3.2). Older Resolve builds
@@ -1385,7 +1385,7 @@ def install_dependencies(venv_path, project_dir):
     # downgrade it, and the fix does not depend on install ordering. Lift both
     # together when server.py is ported to the 2.x layout.
     subprocess.run(
-        [str(pip), "install", "-q", "mcp[cli]>=1.29,<2"],
+        [str(pip), "install", "-q", "mcp[cli]>=1.30,<2"],
         check=True, capture_output=True
     )
 
@@ -1543,7 +1543,7 @@ def verify_resolve_connection(python_path, api_path, lib_path):
 
 def print_banner():
     title = f"DaVinci Resolve MCP Server — Installer v{VERSION}"
-    subtitle = "36 compound · 353 full · 3 platforms"
+    subtitle = "37 compound · 387 full · 3 platforms"
     print()
     print(bold("  ╔══════════════════════════════════════════════════════╗"))
     print(bold(f"  ║{title:^54}║"))

@@ -24,7 +24,7 @@ When you add or change a ``submit``-tagged entry, regenerate the report
 (``venv/bin/python scripts/gen_api_limitations.py``) or the
 ``tests.test_api_limitations_doc`` drift guard fails.
 """
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 VERIFIED_ON = "DaVinci Resolve Studio 21.0.2"
 
@@ -116,6 +116,10 @@ API_TRUTH: List[Dict[str, Any]] = [
                        "which does exactly that.",
         "tags": ["unreliable-return", "project", "flaky", "session-lock"],
         "submit": "bug",
+        "verified_on": "DaVinci Resolve Studio 21.1.0.14",
+        "reconfirmed": "2026-09-09: still true on 21.1.0.14. Delete with another "
+                       "project current returned False; CloseProject on the target "
+                       "then delete returned True, first attempt.",
     },
     {
         "symbol": "Project.SetSetting('timelinePlaybackFrameRate')",
@@ -418,11 +422,23 @@ API_TRUTH: List[Dict[str, Any]] = [
                    "evidence of absence that exists — which makes an omitted "
                    "name unrecoverable by probing. Any capability detection "
                    "built on dir()/hasattr will therefore report a real Fusion "
-                   "method as missing. Resolve's own API objects do not have "
-                   "this problem: Timeline (60), TimelineItem (88) and "
-                   "Composition (92) all enumerate correctly.",
-        "recommended": "Do not treat dir()/hasattr as authoritative for Fusion "
-                       "Tool objects. Keep a curated set of documented Fusion "
+                   "method as missing. Resolve's own API objects enumerate "
+                   "correctly — Timeline (60), TimelineItem (88) and "
+                   "Composition (92) — so the INCOMPLETE ENUMERATION is Fusion's "
+                   "alone. The fabrication is not: measured on Studio 19.1.3.7, "
+                   "`hasattr(timeline_item, \'TotallyMadeUpName\')` returns True, "
+                   "and so does hasattr for a method that genuinely does not "
+                   "exist (ApplyGradeFromStill), while dir() on the same object "
+                   "lists 84 real names and neither of those. So hasattr/getattr "
+                   "is worthless for absence on EVERY Resolve object, Fusion or "
+                   "not; what is special about Fusion Tools is that dir() is "
+                   "wrong there too, leaving no reliable probe at all.",
+        "recommended": "Never use hasattr/getattr to test whether ANY Resolve "
+                       "object has a method — it always says yes. Use dir() "
+                       "membership, and sanity-check the enumeration with a "
+                       "method you know exists before trusting an absence. For "
+                       "Fusion Tool objects not even dir() is authoritative: "
+                       "keep a curated set of documented Fusion "
                        "methods that the enumeration omits, and identify a "
                        "Fusion object positively (ConnectInput / FindMainInput "
                        "/ GetControlPageNames on a Tool, AddTool / FindTool / "
@@ -689,9 +705,22 @@ API_TRUTH: List[Dict[str, Any]] = [
         "object": "MediaPoolItem",
         "reality": "Returns a PREVIEW of the transcription that ends in an "
                    "ellipsis when the full transcript is longer than the property "
-                   "exposes.",
-        "recommended": "Treat a trailing ellipsis as truncation (see "
-                       "media_pool_item get_transcription's `truncated` flag).",
+                   "exposes. Reported still true on Studio 21.1.0.14 by @billcarroll (PR #197; not "
+                   "reproduced here, no 21.1 install) — the property is not "
+                   "the fix. 21.1 adds a SEPARATE method that is not truncated: "
+                   "MediaPoolItem.GetTranscription(useNestedClipTranscription=False) "
+                   "-> {language, segments[{start, end, text, speaker, words[{start, "
+                   "end, text}]}]}, with timecode strings rather than frame numbers. "
+                   "The contributor measured it on a live 21.1.0.14 against an already-transcribed "
+                   "interview clip: 1550 segments, per-word start/end timecodes, a "
+                   "populated `speaker` field, and '(...)' as Resolve's own silence "
+                   "marker. Note the transcript is of the SOURCE clip, so timeline "
+                   "positions must be mapped through GetStart()/GetSourceStartFrame() "
+                   "on the timeline item.",
+        "recommended": "On 21.1+, call MediaPoolItem.GetTranscription() instead of "
+                       "reading the property. On 21.0.x and earlier, treat a "
+                       "trailing ellipsis as truncation (see media_pool_item "
+                       "get_transcription's `truncated` flag).",
         "tags": ["transcription", "truncation"],
         "submit": "bug",
     },
@@ -855,18 +884,80 @@ API_TRUTH: List[Dict[str, Any]] = [
     {
         "symbol": "Native multicam clip creation",
         "object": "MediaPool",
-        "reality": "There is no method to create a native multicam clip from a set "
-                   "of angles. Angles can be stacked onto tracks programmatically, "
-                   "but the multicam-clip conversion is a UI-only step.",
-        "recommended": "Prepare a stacked timeline (media_pool setup_multicam_timeline) "
-                       "and finish the multicam-clip conversion in the Resolve UI.",
-        "tags": ["missing-method", "media-pool", "multicam"],
-        "submit": "missing",
+        "reality": "WITHDRAWN on the strength of a contributor's probe of Studio 21.1.0.14 "
+                   "(@billcarroll, PR #197, 2026-09-08; not reproduced here, no 21.1 "
+                   "install): Resolve 21.1 adds "
+                   "MediaPool.CreateMulticamClip(clips, multicamOptions) -> "
+                   "list[MediaPoolItem], plus TimelineItem.FlattenMulticam, "
+                   "TimelineItem.PerformMulticamSmartSwitch and "
+                   "Timeline.AutoAlignClips. Measured by attribute probe on a live "
+                   "21.1.0.14: each of those four resolves to a "
+                   "<BlackmagicFusion.PyFunctionCall object>, not None — the same "
+                   "discriminator that distinguishes a real method from an absent "
+                   "one elsewhere in this registry. That original probe did not "
+                   "invoke the methods. UPDATE: contributor-validated by "
+                   "@legionsound on Studio 21.1.0.14, macOS, 2026-09-09; not "
+                   "reproduced by the maintainer on 19.1.3.7. Both community "
+                   "interfaces created a Multicam from synthetic red/blue clips "
+                   "and flattened it with COPY_GRADE. Four complete decoded "
+                   "144-frame renders were identical before/after flattening "
+                   "and across interfaces; media type changed Multicam to Video "
+                   "without changing the selected clip span. This verifies the "
+                   "native-selected angle in an ungraded fixture, not angle "
+                   "ordering, grade transfer, audio sync or Smart Switch. See "
+                   "resolve211-multicam.md for exact limits. HISTORICAL, still "
+                   "true of 21.0.x and "
+                   "earlier: there was no method to create a native multicam clip "
+                   "from a set of angles; angles could be stacked onto tracks "
+                   "programmatically but the multicam-clip conversion was a UI-only "
+                   "step. Falsified further (either direction) by a session that "
+                   "actually calls CreateMulticamClip on a scratch project.",
+        "recommended": "On 21.1+, call MediaPool.CreateMulticamClip. On 21.0.x and "
+                       "earlier, prepare a stacked timeline (media_pool "
+                       "setup_multicam_timeline) and finish the multicam-clip "
+                       "conversion in the Resolve UI.",
+        "tags": ["media-pool", "multicam", "fixed-in-21.1"],
     },
     {
         "symbol": "Transition create / copy / clone",
         "object": "Timeline / TimelineItem",
-        "reality": "There is no method to ADD or CLONE an edit transition — no "
+        "reality": "CREATION IS FIXED IN 21.1, READBACK IS NOT. Reported by @billcarroll "
+                   "(PR #197) from an attribute probe on Studio 21.1.0.14 (2026-09-08; "
+                   "not reproduced here, no 21.1 install): "
+                   "TimelineItem.AddTransition resolves to a "
+                   "<BlackmagicFusion.PyFunctionCall object>, not None. Its stub "
+                   "signature is AddTransition(transitionOptions) -> TimelineItem | "
+                   "None, where transitionOptions carries type (e.g. 'Cross "
+                   "Dissolve'), category ('simple'|'fusion'|'ofx'|'audio'), position "
+                   "('start'|'end'), alignment ('left'|'center'|'right') and an "
+                   "optional duration in frames. That original probe did not invoke "
+                   "the method. UPDATE, contributor-validated by @legionsound on "
+                   "Studio 21.1.0.14, macOS, 2026-09-09 (not reproduced by the "
+                   "maintainer on 19.1.3.7): a synthetic red/blue pair with handles "
+                   "accepted a 24-frame centered Cross Dissolve. GetStart/End "
+                   "returned 59/83 around cut 71, GetDuration returned 24, and "
+                   "source clip spans were unchanged. Both community interfaces "
+                   "rendered identical 142-frame movies with a progressive "
+                   "red-to-blue blend. With zero handles the native call returned "
+                   "None. This validates that fixture, not other effects, audio "
+                   "transitions or alignments. See resolve211-native-transitions.md. "
+                   "DURATION IS OPTIONAL AND AN EXPLICIT NULL IS NOT A SPECIAL CASE, "
+                   "measured by @legionsound on Studio 21.1.0.14 (2026-09-09) on "
+                   "fresh timelines with the same handled red/blue fixture: omitting "
+                   "the duration key and passing duration=None behaved IDENTICALLY, "
+                   "both creating a transition at GetDuration()==8 spanning 67-75 "
+                   "around a cut at 71. So a wrapper must NOT strip an explicit null "
+                   "to work around a refusal — there is no refusal to work around. "
+                   "The 8 frames is what that build chose for that fixture, NOT a "
+                   "documented default; this was creation and readback only, not "
+                   "rendered. "
+                   "WHAT REMAINS MISSING ON 21.1: reading a "
+                   "transition back. There is still no accessor for an existing "
+                   "transition's type, alignment or duration beyond its name string "
+                   "and frame range, and no clone verb — alignment and duration are "
+                   "write-only arguments to AddTransition. The pre-21.1 statement, "
+                   "kept as the historical record: there was no method to ADD or "
+                   "CLONE an edit transition — no "
                    "AddTransition/CreateTransition/AddVideoTransition on Timeline "
                    "or TimelineItem (dir(), 21.0.4.5). CORRECTION, measured on "
                    "Studio 21.0.4.5 (2026-08-12): this entry previously said "
@@ -886,7 +977,8 @@ API_TRUTH: List[Dict[str, Any]] = [
                    "a transition item and a clip item is GetProperty(): a "
                    "transition returns an EMPTY dict where a video clip returns 26 "
                    "transform keys; it also has no MediaPoolItem and no Fusion "
-                   "comp. WHAT IS GENUINELY MISSING: creation, cloning, and any "
+                   "comp. WHAT IS GENUINELY MISSING (pre-21.1: creation too; on "
+                   "21.1+ read the paragraph above): cloning, and any "
                    "type/alignment/parameter detail — the transition's kind is "
                    "knowable ONLY from its name string, and there is no way to "
                    "read its alignment (centered/start/end) or edit its duration. "
@@ -913,7 +1005,9 @@ API_TRUTH: List[Dict[str, Any]] = [
                        "server's drp place_transition writes a cross dissolve at an "
                        "abutting cut ({track, atFrame, durationFrames}) and it "
                        "round-trips into Resolve 21.0.4.5 reading back at the "
-                       "expected centered range.",
+                       "expected centered range. On 21.1+ prefer "
+                       "TimelineItem.AddTransition, which takes the type, category, "
+                       "edge, alignment and duration directly.",
         "tags": ["missing-method", "timeline", "transition"],
         "submit": "missing",
     },
@@ -1447,6 +1541,31 @@ API_TRUTH: List[Dict[str, Any]] = [
         "submit": "bug",
     },
     {
+        "symbol": "SetRenderSettings MarkIn/MarkOut below the timeline start are clamped, not refused",
+        "object": "Project / Timeline",
+        "reality": "SetRenderSettings takes MarkIn/MarkOut as ABSOLUTE record "
+                   "frames, and a value below the timeline's start frame is "
+                   "silently clamped to the start: measured on Studio 19.1.3.7 "
+                   "(2026-09-08) on an 86400-start timeline, MarkIn=MarkOut=86420 "
+                   "rendered timeline frame 20 and MarkIn=MarkOut=20 rendered "
+                   "frame 0 — one frame, True from SetRenderSettings, no error "
+                   "anywhere. The trap is that Timeline.GetMarkInOut reports the "
+                   "user's marks RELATIVE to the timeline start (Blackmagic's own "
+                   "README example is {'in': 0, 'out': 134}; the 21.1 stub says "
+                   "'record frame relative to timeline start'), so feeding its "
+                   "output straight into SetRenderSettings renders the wrong range "
+                   "with every readback agreeing. SetMarkInOut itself stores "
+                   "whatever number it is given (10 reads back 10, 86410 reads "
+                   "back 86410), so a script-written range can be in either space.",
+        "recommended": "Offset GetMarkInOut values by Timeline.GetStartFrame() before "
+                       "passing them to SetRenderSettings when they fall below the "
+                       "start frame (timeline_frame capture does this when it puts "
+                       "a user's range back). Verify a render range from the "
+                       "delivered frames, never from the settings call's return.",
+        "tags": ["render", "silent-failure", "frame-space", "mark-range"],
+        "submit": "bug",
+    },
+    {
         "symbol": "SetRenderSettings ExportSubtitle / SubtitleFormat had no observable effect",
         "object": "Project (render settings)",
         "reality": "Queuing a render with {'ExportSubtitle': True, "
@@ -1841,6 +1960,26 @@ API_TRUTH: List[Dict[str, Any]] = [
                        "values round-trip byte-identically via the lossless Body "
                        "pass-through.",
         "tags": ["silent-failure", "color", "node-graph", "layout", "drx"],
+    },
+    {
+        "symbol": "TimelineItem.AddVersion / Graph.ApplyGradeFromDRX (page-dependent)",
+        "object": "TimelineItem / Graph",
+        "signature": "AddVersion(name, type) -> bool; ApplyGradeFromDRX(path, gradeMode) -> bool",
+        "reality": "Both return False for every clip while the GUI sits on the "
+                   "EDIT page, with no exception and no other signal. Measured on "
+                   "Studio 19.1.3.7 (2026-09-08) on a live conform: 12 of 12 "
+                   "clips failed from the edit page, then 12 of 12 applied after "
+                   "OpenPage('color') with nothing else changed; an earlier "
+                   "254-clip batch on the same timeline had succeeded while the "
+                   "page was color. Read-side calls (GetNodeGraph, GetNumNodes, "
+                   "GetVersionNameList) answer normally from the edit page, so "
+                   "the False cannot be told apart from a bad .drx or a locked "
+                   "clip without checking the page.",
+        "recommended": "Read GetCurrentPage() before any grade mutation; OpenPage"
+                       "('color') for the batch and restore the page afterwards. "
+                       "timeline_item_color.apply_trace_plan does this itself and "
+                       "reports {page: {before, switched, restored}}.",
+        "tags": ["silent-failure", "color", "grade", "page", "drx", "version"],
     },
     {
         "symbol": "MediaPool.AppendToTimeline clipInfo endFrame (exclusive bound)",
@@ -3113,6 +3252,128 @@ API_TRUTH: List[Dict[str, Any]] = [
         "submit": "bug",
         "mitigation": ["render.set_settings warnings"],
     },
+    {
+        "symbol": "Resolve.ValidateDCTL is sensitive to source layout",
+        "object": "Resolve",
+        "signature": "(dctlSource) -> str | None  (21.1+)",
+        "reality": "Reported by @legionsound (issue #207) from Studio 21.1.0.14 on "
+                   "macOS; NOT reproduced here (no 21.1 install). The documented "
+                   "success result is None. A minimal identity transform written "
+                   "across several lines — `__DEVICE__ float3 transform(...)` with "
+                   "the body on its own lines — validates (None). The SAME function "
+                   "collapsed onto one line consistently returns 'DCTL Error: main "
+                   "DCTL function does not have return value.', which is false: the "
+                   "return statement is there. A genuinely invalid source returns "
+                   "'cannot find main DCTL function.', so the validator does "
+                   "distinguish; it is the single-line layout it misreads. An "
+                   "earlier multi-line timeout did not reproduce after a Resolve "
+                   "restart with a 30-second limit. Nothing establishes a GPU "
+                   "compiler or render defect — this is the validator's parse, not "
+                   "the DCTL's execution. EncryptDCTL untested.",
+        "recommended": "Any wrapper around ValidateDCTL must pass the native "
+                       "diagnostic through verbatim and must not reflow or rewrite "
+                       "the user's source to dodge it; ship the multi-line identity "
+                       "fixture as the known-good control. A 'no return value' "
+                       "error on a one-line function is this quirk, not a missing "
+                       "return — re-run the validation with the function laid out "
+                       "across lines before believing it. This server's own "
+                       "`dctl validate` is a static, offline check (entry point, "
+                       "brace balance, float suffixes) and does not call "
+                       "ValidateDCTL at all. The separate `dctl validate_native` and "
+                       "granular `validate_dctl_native` now expose the native "
+                       "validator without changing source or diagnostics. Both "
+                       "interfaces were contributor-validated against the three "
+                       "fixtures on Studio 21.1.0.14; see "
+                       "resolve211-dctl-validation.md.",
+        "tags": ["dctl", "validation", "unreliable-return", "version-gated", "reported"],
+        "submit": "bug",
+    },
+    # ── Measured on Studio 21.1.0.14, 2026-09-09 (trap-aware execution work) ──
+    {
+        "symbol": "TimelineItem.CopyGrades",
+        "object": "TimelineItem",
+        "signature": "(tgtTimelineItems) -> bool",
+        "reality": "REPLACES the target's grade wholesale; it does not merge. "
+                   "Measured by exporting a 33-point LUT from the target before "
+                   "and after: after the copy the target's LUT is byte-identical "
+                   "to the source's and differs from the grade the target had. "
+                   "Returns True while doing it. It creates NO grade version - "
+                   "GetVersionNameList is unchanged across the call - so the "
+                   "overwritten grade cannot be recovered.",
+        "recommended": "Never call this on clips carrying hand-work. Prove the "
+                       "targets are uniform first by exporting each one's LUT "
+                       "(Color page) and comparing bytes. If the prior grade has "
+                       "any value, call TimelineItem.AddVersion() first - the "
+                       "copy will not make a restore point for you.",
+        "tags": ["destructive", "unrecoverable", "grade", "no-version"],
+        "destroys_prior_work": True,
+        "verified_on": "DaVinci Resolve Studio 21.1.0.14",
+        "reconfirmed": "2026-09-13: independently re-measured on 21.1.0.14 by a "
+                       "second contributor running color_grade_live_probe. "
+                       "CopyGrades returned True; the target's exported grade "
+                       "became byte-identical to the source's (same digest on "
+                       "both); GetVersionNameList read ['Version 1'] before and "
+                       "after, so there is still no recovery version. This is the "
+                       "entry that makes acknowledge_trap refuse, so it is the one "
+                       "that most needed a second pair of hands.",
+    },
+    {
+        "symbol": "TimelineItem.ApplyGradeFromStill",
+        "object": "TimelineItem",
+        "reality": "Does not exist. There is no ApplyGradeFromStill on "
+                   "TimelineItem or on Graph in 21.1, and it is absent from the "
+                   "typed stubs. Code calling it raises AttributeError, and any "
+                   "wrapper that swallows that reports success for a grade it "
+                   "never applied.",
+        "recommended": "Use Graph.ApplyGradeFromDRX(path, gradeMode) against a "
+                       "'.drx' (gradeMode 0=no keyframes, 1=source-timecode "
+                       "aligned, 2=start-frame aligned).",
+        "tags": ["missing-method", "grade"],
+        "verified_on": "DaVinci Resolve Studio 21.1.0.14",
+    },
+    {
+        "symbol": "TimelineItem.ExportLUT",
+        "object": "TimelineItem",
+        "signature": "(exportType, path) -> bool",
+        "reality": "Gated on the Color page. Measured on all six pages: returns "
+                   "False from media, edit, fusion, fairlight and deliver, and "
+                   "True only from color. The refusal is a bare False with no "
+                   "reason. It does at least fail cleanly - no file is written "
+                   "on the failing pages, so there is no stale-file trap here.",
+        "recommended": "resolve.OpenPage('color') before the call and restore "
+                       "the prior page afterwards. Treat a False as 'you were on "
+                       "the wrong page' before suspecting the path.",
+        "tags": ["page-gated", "silent-failure", "lut"],
+        "submit": "bug",
+        "verified_on": "DaVinci Resolve Studio 21.1.0.14",
+        "reconfirmed": "2026-09-13: independently re-measured on 21.1.0.14 by a "
+                       "second contributor. Returned True and wrote a file only "
+                       "from color; deliver, edit, fairlight, fusion and media all "
+                       "returned False and wrote nothing, with no stale files left "
+                       "behind on the failing pages.",
+    },
+    {
+        "symbol": "Timeline.DuplicateTimeline",
+        "object": "Timeline",
+        "signature": "(timelineName) -> Timeline",
+        "reality": "Silently moves the project's current-timeline pointer to the "
+                   "new duplicate. The return value is the duplicate and nothing "
+                   "signals that 'current' changed, so every subsequent mutation "
+                   "lands in the copy while the caller believes it is still "
+                   "editing the original.",
+        "recommended": "Capture GetCurrentTimeline() before the call and "
+                       "SetCurrentTimeline() back after it, checking the return "
+                       "- SetCurrentTimeline restores it and returns True. "
+                       "Never discard that boolean. "
+                       "src/utils/timeline_versioning.py:archive_current_timeline "
+                       "already does this and fails loudly if the restore fails.",
+        "tags": ["side-effect", "silent-failure", "timeline"],
+        "verified_on": "DaVinci Resolve Studio 21.1.0.14",
+        "reconfirmed": "2026-09-13: independently re-measured on 21.1.0.14 by a "
+                       "second contributor. The current-timeline pointer moved to "
+                       "the duplicate, and SetCurrentTimeline put it back.",
+    },
+
 ]
 
 
@@ -3149,3 +3410,64 @@ def submittable_limitations() -> Dict[str, List[Dict[str, Any]]]:
         if kind in groups:
             groups[kind].append(e)
     return groups
+
+
+# ── Action → Resolve symbol registry ─────────────────────────────────────────
+#
+# Which Resolve symbols a compound (tool, action) actually calls. Used to push
+# the relevant fact to the caller at the moment of the call instead of waiting
+# for someone to think to query this file.
+#
+# Every mapping is declared explicitly and matched by exact symbol equality.
+# Substring or fuzzy matching is forbidden here for the reason given in
+# `server._setting_limitation`: attaching an unrelated explanation to a call
+# reads as a diagnosis, and a wrong diagnosis is worse than none. A guard
+# (`tests/test_action_symbol_registry.py`) asserts every symbol named below is a
+# real API_TRUTH entry and every action is a real handler.
+ACTION_SYMBOLS: Dict[Tuple[str, str], List[str]] = {
+    ("timeline_item_color", "copy_grades"): ["TimelineItem.CopyGrades"],
+    ("timeline_item_color", "safe_copy_grade"): ["TimelineItem.CopyGrades"],
+    ("timeline_item_color", "bulk_match_to_hero"): ["TimelineItem.CopyGrades"],
+    ("timeline", "apply_look_to_items"): ["TimelineItem.CopyGrades"],
+    ("timeline_item_color", "export_lut"): ["TimelineItem.ExportLUT"],
+    ("timeline_item_color", "safe_export_lut"): ["TimelineItem.ExportLUT"],
+    ("timeline", "duplicate"): ["Timeline.DuplicateTimeline"],
+}
+
+
+def _entry_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    """The single entry whose `symbol` is exactly `symbol`."""
+    for entry in API_TRUTH:
+        if entry.get("symbol") == symbol:
+            return entry
+    return None
+
+
+def traps_for(tool: str, action: str) -> List[Dict[str, Any]]:
+    """Verified facts for the symbols this (tool, action) actually calls.
+
+    Exact matches only — an action with no declared mapping returns nothing
+    rather than guessing.
+    """
+    out: List[Dict[str, Any]] = []
+    for symbol in ACTION_SYMBOLS.get((tool, action), ()):
+        entry = _entry_for_symbol(symbol)
+        if entry is not None:
+            out.append(entry)
+    return out
+
+
+def trap_notice(entry: Dict[str, Any]) -> Dict[str, str]:
+    """The compact push form: what it does, what to do instead.
+
+    Deliberately three fields. A full entry carries signature, tags, submit
+    status and mitigation lists that cost tokens on every single call and tell
+    the caller nothing they can act on at the callsite. Response weight is a
+    real cost on long grading sessions, so the push stays small and the full
+    entry stays one `resolve_control(action="api_truth")` away.
+    """
+    return {
+        "symbol": entry.get("symbol", ""),
+        "reality": entry.get("reality", ""),
+        "recommended": entry.get("recommended", ""),
+    }

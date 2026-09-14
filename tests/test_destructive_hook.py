@@ -219,6 +219,25 @@ class SecurityPolicy(unittest.TestCase):
         with open(self.audit_path, "r", encoding="utf-8") as handle:
             return [json.loads(line) for line in handle if line.strip()]
 
+    def test_native_21_1_setters_are_registered_writes(self) -> None:
+        """#208's set_speed/set_fades landed unregistered: recognised=False,
+        destructive=False, so every gate skipped a clip-speed rewrite (a
+        rippling one moves every later clip). Pin them beside set_retime."""
+        from src.utils.execution_lifecycle import classify_operation_risk
+        for action, params in (
+            ("set_speed", {"options": {"Percentage": 50, "RippleTimeline": True}}),
+            ("set_fades", {"options": {"FadeIn": 24}}),
+        ):
+            with self.subTest(action=action):
+                self.assertTrue(destructive_hook.is_destructive("timeline_item", action))
+                risk = classify_operation_risk("timeline_item", action, params).to_dict()
+                self.assertTrue(risk["recognised"], risk)
+                self.assertTrue(risk["destructive"], risk)
+                self.assertEqual(
+                    destructive_hook.risk_level_for_action("timeline_item", action, params),
+                    destructive_hook.risk_level_for_action("timeline_item", "set_retime", {}),
+                )
+
     def test_risk_level_classifier_names_low_medium_and_high(self) -> None:
         self.assertEqual(
             destructive_hook.risk_level_for_action("timeline_markers", "add", {}),
@@ -416,8 +435,8 @@ class SecurityPolicy(unittest.TestCase):
 
     # ── dry_run on actions without a native dry-run path ──────────────────
     #
-    # Before v2.211.0 `timeline_markers.add` with dry_run=true added a real
-    # marker: the handler never read the flag. The wrapper now refuses an
+    # Before v2.211.0 some marker operations with dry_run=true still ran for real:
+    # the handlers never read the flag. The wrapper now refuses an
     # explicit dry-run request on every registered destructive action outside
     # NATIVE_DRY_RUN_ACTIONS — before archive, before state lookup, before the
     # handler — and says that nothing was simulated or executed.
@@ -436,7 +455,10 @@ class SecurityPolicy(unittest.TestCase):
             calls.append(action)
             return {"success": True}
 
-        result = fake_markers("add", {"frame": 12, "dry_run": True})
+        result = fake_markers(
+            "update_custom_data",
+            {"frame": 12, "custom_data": "marker-12", "dry_run": True},
+        )
 
         self.assertFalse(result["success"])
         self.assertEqual(result["status"], "dry_run_unavailable")
@@ -498,8 +520,30 @@ class SecurityPolicy(unittest.TestCase):
             calls.append(action)
             return {"success": True}
 
-        result = fake_markers("add", {"frame": 12, "dry_run": False})
+        for value in (False, "false", "0", "no", "off"):
+            with self.subTest(value=value):
+                result = fake_markers("add", {"frame": 12, "dry_run": value})
+                self.assertTrue(result["success"])
+        self.assertEqual(calls, ["add", "add", "add", "add", "add"])
+
+    def test_native_dry_run_payload_skips_archive_and_reaches_handler(self) -> None:
+        self._prefs(safe_mode=False)
+
+        def failing_provider():
+            raise AssertionError("native dry-run preview must not resolve project state")
+        destructive_hook.register_project_root_provider(failing_provider)
+
+        calls: list[str] = []
+
+        @destructive_hook.destructive_op("timeline_markers")
+        def fake_markers(action: str, params=None):
+            calls.append(action)
+            return {"success": True, "dry_run": True, "executed": False}
+
+        result = fake_markers("add", {"frame": 12, "dry_run": "true"})
+
         self.assertTrue(result["success"])
+        self.assertTrue(result["dry_run"])
         self.assertEqual(calls, ["add"])
 
     def test_dry_run_on_a_non_destructive_action_is_untouched(self) -> None:

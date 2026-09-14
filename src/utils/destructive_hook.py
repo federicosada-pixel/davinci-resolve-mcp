@@ -33,6 +33,8 @@ import uuid
 from typing import Any, Callable, Dict, FrozenSet, Optional, Tuple
 
 from src.utils import analysis_runs, brain_edits, media_pool_changes, timeline_versioning
+from src.utils.api_truth import traps_for, trap_notice
+from src.utils.bool_params import coerce_bool, explicit_bool_param
 from src.utils.execution_lifecycle import RiskAssessment, RiskLevel, classify_operation_risk
 
 logger = logging.getLogger("resolve-mcp.destructive-hook")
@@ -63,6 +65,42 @@ SAFE_MODE_BLOCKED_RISK_LEVELS: FrozenSet[str] = frozenset({
 # replace_clip/link_*). The test_destructive_registry_drift guard asserts every
 # string here is a real handler so this can't regress.
 DESTRUCTIVE_ACTIONS_BY_TOOL: Dict[str, FrozenSet[str]] = {
+    # Plugin-folder writes. These create, replace and delete files that Resolve
+    # and Fusion later load and run: a Fuse registers on the next restart, a
+    # Resolve-page script runs when clicked. Until they were listed here every
+    # gate treated them as reads, and a dry run of `install` wrote the file for
+    # real. They never mutate the timeline, so NON_TIMELINE_WRITE_TOOLS keeps
+    # them out of timeline archiving while every gate still sees them.
+    "dctl": frozenset({"encrypt_native", "install", "remove"}),
+    # LUT files under Resolve's master LUT root. Writes are confined to the
+    # namespaced MCP/ subfolder by src/utils/lut_files.py; these entries make
+    # every gate see them as the writes they are.
+    "lut": frozenset({"attenuate", "install", "remove"}),
+    "fuse_plugin": frozenset({"install", "remove"}),
+    "script_plugin": frozenset({
+        "install",
+        "remove",
+        "safe_install_extension",
+        "safe_remove_extension",
+    }),
+    # Deletes the classifier already rated HIGH (CRITICAL for the raw project
+    # delete) on tools that carried no @_destructive_op, so safe mode never saw
+    # them. Plus the 21.0 AI deblur, rated MEDIUM: it creates media, and is
+    # registered so it is audited and its dry run is honest.
+    "folder": frozenset({"remove_motion_blur"}),
+    "fusion_comp": frozenset({"delete_keyframe", "delete_tool"}),
+    "gallery_stills": frozenset({"delete_stills"}),
+    "media_pool_item": frozenset({"remove_motion_blur"}),
+    "media_pool_item_markers": frozenset({
+        "delete_at_frame",
+        "delete_by_color",
+        "delete_by_custom_data",
+    }),
+    "project_manager": frozenset({"delete", "safe_project_delete"}),
+    "project_settings": frozenset({"delete_color_group"}),
+    "render": frozenset({"delete_all_jobs", "delete_job", "delete_preset"}),
+    "render_presets": frozenset({"delete_burnin"}),
+    "resolve_control": frozenset({"delete_user_preferences_preset"}),
     "media_pool": frozenset({
         "delete_clips",
         "delete_folders",
@@ -74,6 +112,7 @@ DESTRUCTIVE_ACTIONS_BY_TOOL: Dict[str, FrozenSet[str]] = {
         "create_timeline_from_clips",
         "append_to_timeline",
         "setup_multicam_timeline",
+        "create_multicam_clip",
         "create_stereo_clip",
         "auto_sync_audio",
         "set_clip_marks",
@@ -86,6 +125,9 @@ DESTRUCTIVE_ACTIONS_BY_TOOL: Dict[str, FrozenSet[str]] = {
         "execute_swap",
     }),
     "timeline": frozenset({
+        "set_output_blanking",
+        "normalize_audio_level",
+        "auto_align_clips",
         "delete_clips",
         "move_clips",
         "duplicate_clips",
@@ -137,6 +179,9 @@ DESTRUCTIVE_ACTIONS_BY_TOOL: Dict[str, FrozenSet[str]] = {
         "create_subtitles",
     }),
     "timeline_item": frozenset({
+        "delete_keyframe",
+        "set_output_blanking",
+        "set_use_timeline_for_output_blanking",
         "set_clip_enabled",
         "set_property",
         "set_name",
@@ -147,6 +192,14 @@ DESTRUCTIVE_ACTIONS_BY_TOOL: Dict[str, FrozenSet[str]] = {
         "set_retime",
         "set_composite",
         "set_audio",
+        # Native 21.1 setters (#208). Registered on landing: as contributed the
+        # classifier did not recognise them, so safe mode, the dry-run refusal,
+        # the audit log and the operation log all skipped a call that rewrites a
+        # clip's speed — and, with RippleTimeline true, moves every clip after it.
+        "flatten_multicam",
+        "add_transition",
+        "set_speed",
+        "set_fades",
     }),
     "timeline_item_markers": frozenset({
         "add",
@@ -169,6 +222,7 @@ DESTRUCTIVE_ACTIONS_BY_TOOL: Dict[str, FrozenSet[str]] = {
     "timeline_item_color": frozenset({
         "set_cdl",
         "copy_grades",
+        "apply_trace_plan",
         "reset_all_node_colors",
         "assign_color_group",
         "remove_from_color_group",
@@ -217,6 +271,26 @@ NO_ARCHIVE_ON_KEYS: Dict[Tuple[str, str], frozenset] = {
     # Notes/Comments are noise; Name changes are real edits and stay archived.
     ("timeline", "set_clip_property"): frozenset({"Notes", "Comments"}),
 }
+
+
+# ── Non-timeline write tools ────────────────────────────────────────────────
+#
+# Tools whose registered actions do not mutate the working timeline: they write
+# plugin folders, or act on projects, the render queue, presets, the gallery,
+# pool items or app preferences. Every
+# gate applies to them — safe mode, dry-run refusal, the audit log — but they
+# skip version-on-mutate archiving, and skip resolving the versioning context
+# at all: that goes through the project-root provider, which reaches Resolve,
+# and installing a shader must neither snapshot the open timeline nor touch
+# Resolve. `media_pool` has its own branch for the same reason; these differ in
+# that there is no project state to log.
+
+NON_TIMELINE_WRITE_TOOLS: frozenset = frozenset({
+    "dctl", "fuse_plugin", "lut", "script_plugin",
+    "folder", "gallery_stills", "media_pool_item", "media_pool_item_markers",
+    "project_manager", "project_settings", "render", "render_presets",
+    "resolve_control",
+})
 
 
 # ── Strict-mode allowlist ───────────────────────────────────────────────────
@@ -277,22 +351,24 @@ DRY_RUN_DEFAULT_TRUE_ACTIONS: frozenset = frozenset({
 
 NATIVE_DRY_RUN_ACTIONS: frozenset = frozenset({
     ("media_pool", "clear_clip_marks"),
+    ("timeline_markers", "add"),
+    ("timeline_item_color", "apply_trace_plan"),
     ("media_pool", "set_clip_marks"),
     ("media_pool", "setup_multicam_timeline"),
     ("timeline", "apply_cuts"),
     ("timeline", "ripple_insert"),
     ("timeline_ai", "create_subtitles"),
+    ("script_plugin", "safe_install_extension"),
+    ("script_plugin", "safe_remove_extension"),
+    ("project_manager", "safe_project_delete"),
+    ("lut", "attenuate"),
+    ("lut", "install"),
+    ("lut", "remove"),
 })
 
 
 def _explicit_dry_run_requested(params: Optional[Dict[str, Any]]) -> bool:
-    if not isinstance(params, dict):
-        return False
-    if "dry_run" in params:
-        return bool(params["dry_run"])
-    if "dryRun" in params:
-        return bool(params["dryRun"])
-    return False
+    return explicit_bool_param(params, "dry_run", "dryRun") is True
 
 
 def lacks_native_dry_run(
@@ -354,11 +430,14 @@ def _payload_is_plan_only(
     tool_name: str, action: str, params: Optional[Dict[str, Any]],
 ) -> bool:
     """True iff this call only produces a plan and mutates nothing."""
+    dry_run = explicit_bool_param(params, "dry_run", "dryRun")
+    if (tool_name, action) in NATIVE_DRY_RUN_ACTIONS and dry_run is True:
+        return True
     if (tool_name, action) not in DRY_RUN_DEFAULT_TRUE_ACTIONS:
         return False
-    if not isinstance(params, dict):
+    if dry_run is None:
         return True  # dry_run defaults to True for these actions
-    return bool(params.get("dry_run", params.get("dryRun", True)))
+    return dry_run
 
 
 def _payload_only_touches_no_archive_keys(
@@ -491,16 +570,7 @@ def _read_preference(key: str, default: Any = None) -> Any:
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "off"}:
-            return False
-        return default
-    return bool(value)
+    return coerce_bool(value, default)
 
 
 def _safe_mode_enabled() -> bool:
@@ -714,6 +784,79 @@ def _extract_metric(params: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Op
 # ── Decorator ────────────────────────────────────────────────────────────────
 
 
+#: Set truthy to disable the trap guard entirely (both the refusal and the
+#: advisory push). Exists because the refusal is a behaviour change for callers
+#: that previously got a bare `{"success": true}` from a destructive copy.
+TRAP_GUARD_ENV = "RESOLVE_MCP_DISABLE_TRAP_GUARD"
+
+
+def _trap_guard_disabled() -> bool:
+    return os.environ.get(TRAP_GUARD_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+#: Actions that already make the caller confirm, so the trap guard must NOT also
+#: refuse them.
+#:
+#: `destroys_prior_work` is a property of the SYMBOL (TimelineItem.CopyGrades),
+#: but four actions call that symbol and two of them already own a confirmation
+#: path. Refusing those means the caller is told to add `acknowledge_trap`, and
+#: only after retrying discovers they also need a confirm token — two
+#: acknowledgements for one operation, found serially. Worse, it lands hardest on
+#: `safe_copy_grade`, whose whole name promises it is the careful route; making
+#: it the most irritating to call pushes people toward the raw `copy_grades` the
+#: guard exists to protect them from.
+#:
+#: Two mechanisms enforcing one rule drift apart. The confirm-token flow is older
+#: and more specific, so it wins and this guard stands down. These actions still
+#: get the advisory `known_limitation` — the fact is worth having, the second
+#: refusal is not.
+TRAP_REFUSAL_EXEMPT_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
+    # Issues a confirm_token whose preview names the exact risk: "Replaces the
+    # entire node graph on every successfully resolved target item."
+    ("timeline_item_color", "safe_copy_grade"),
+    # Dry-run-by-default in the handler (`p.get("dry_run", True)`), then
+    # confirm_token to execute. A first call with no params mutates nothing.
+    ("timeline_item_color", "bulk_match_to_hero"),
+})
+
+
+def _trap_acknowledged(params: Optional[Dict[str, Any]]) -> bool:
+    """Did the caller explicitly accept a known-destructive behaviour?"""
+    return bool(isinstance(params, dict) and params.get("acknowledge_trap"))
+
+
+def _trap_block_response(
+    tool_name: str, action: str, blocking: list,
+) -> Dict[str, Any]:
+    """Refuse a call whose verified behaviour destroys unrecoverable work.
+
+    The point is not to forbid the operation — it is to make the caller say out
+    loud that they know what it does. `CopyGrades` returns True while replacing
+    a hand-built grade wholesale and leaving no version to go back to, so a
+    caller who did not know that cannot tell success from loss.
+    """
+    return {
+        "success": False,
+        "error": (
+            f"'{tool_name}.{action}' is refused: its verified behaviour destroys "
+            "existing work that cannot be recovered afterwards. Read "
+            "`known_limitation`, then re-send with acknowledge_trap=true if that "
+            "is genuinely what you want."
+        ),
+        "known_limitation": [trap_notice(e) for e in blocking],
+        "retry_with": {"acknowledge_trap": True},
+        "override_env": TRAP_GUARD_ENV,
+    }
+
+
+def _attach_trap_notices(result: Any, traps: list) -> Any:
+    """Ride the verified fact along on the result, without overwriting one."""
+    if not traps or not isinstance(result, dict):
+        return result
+    result.setdefault("known_limitation", [trap_notice(e) for e in traps])
+    return result
+
+
 def destructive_op(tool_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Wrap a top-level tool function with the version-on-mutate hook.
 
@@ -723,8 +866,7 @@ def destructive_op(tool_name: str) -> Callable[[Callable[..., Any]], Callable[..
     """
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-        @functools.wraps(fn)
-        def wrapper(action: str, params: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Any:
+        def _inner(action: str, params: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Any:
             if lacks_native_dry_run(tool_name, action, params):
                 # An explicit dry-run request this handler would silently
                 # execute for real. Refuse before archive, state lookup, or the
@@ -770,6 +912,31 @@ def destructive_op(tool_name: str) -> Callable[[Callable[..., Any]], Callable[..
                     operation_id=operation_id,
                     tool_name=tool_name,
                     action=action,
+                    risk_level=risk_level,
+                    recognised=risk_recognised,
+                )
+
+            if tool_name in NON_TIMELINE_WRITE_TOOLS:
+                result = fn(action, params, *args, **kwargs)
+                _audit_security_event(
+                    operation_id=operation_id,
+                    tool_name=tool_name,
+                    action=action,
+                    risk_level=risk_level,
+                    status="allowed",
+                    params=params,
+                    reason="not_a_timeline_mutation",
+                    recognised=risk_recognised,
+                )
+                if isinstance(result, dict):
+                    result.setdefault("_versioning", {
+                        "analysis_run_id": None,
+                        "archived": False,
+                        "skipped_reason": "not_a_timeline_mutation",
+                    })
+                return _annotate_security(
+                    result,
+                    operation_id=operation_id,
                     risk_level=risk_level,
                     recognised=risk_recognised,
                 )
@@ -1046,6 +1213,29 @@ def destructive_op(tool_name: str) -> Callable[[Callable[..., Any]], Callable[..
                 risk_level=risk_level,
                 recognised=risk_recognised,
             )
+
+        @functools.wraps(fn)
+        def wrapper(action: str, params: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Any:
+            # Trap push. `_inner` has a dozen return paths (dry-run refusal,
+            # safe-mode block, pending-confirm, strict/no-context, normal); one
+            # outer attach point covers all of them and cannot drift as those
+            # paths change.
+            traps = traps_for(tool_name, action)
+            if traps and not _trap_guard_disabled():
+                blocking = [t for t in traps if t.get("destroys_prior_work")]
+                # A dry run destroys nothing, so there is nothing to acknowledge
+                # — and preempting `_inner` here would swallow its
+                # DRY_RUN_UNAVAILABLE refusal, which is the more important
+                # answer: it tells the caller this action cannot be previewed
+                # at all. The advisory push still rides along on that refusal.
+                if (
+                    blocking
+                    and (tool_name, action) not in TRAP_REFUSAL_EXEMPT_ACTIONS
+                    and not _trap_acknowledged(params)
+                    and not _explicit_dry_run_requested(params)
+                ):
+                    return _trap_block_response(tool_name, action, blocking)
+            return _attach_trap_notices(_inner(action, params, *args, **kwargs), traps)
 
         wrapper.__wrapped_tool_name__ = tool_name  # type: ignore[attr-defined]
         wrapper.__is_destructive_wrapped__ = True  # type: ignore[attr-defined]
