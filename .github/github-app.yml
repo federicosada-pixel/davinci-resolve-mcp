@@ -1,0 +1,7 @@
+instructions: Default to concise, high-information responses. Lead with the answer. Do not restate my request, add a preamble, recap, or explain basics unless asked. Aim for under 150 words and use no more than 6 bullets. Offer to expand rather than anticipating every possible question.
+scripts:
+  - name: Battery
+    command: checker battery life
+automation:
+  auto_issue_session: true
+  remote_control: true
