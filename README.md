@@ -128,6 +128,25 @@ venv/bin/python -m src.control_panel
 
 The command starts a loopback-only server and opens the control panel in your browser at a URL that carries a per-launch access token (`http://127.0.0.1:8765/#token=…`) — use that exact URL; the panel refuses requests without it. To have an AI coding agent do this, ask: **"Open the Resolve MCP control panel for this repo."** Agents should use `venv/bin/python -m src.control_panel` unless your Python environment is already active. Persisted analysis jobs refresh the local search index automatically after successful slices; the manual Build Index action is for rebuilding from existing reports.
 
+### Command-line workflows
+
+The npm launcher also exposes the long-running analysis batch CLI, so a batch
+can run under cron or CI without keeping an MCP conversation open:
+
+```bash
+npx davinci-resolve-mcp batch plan /path/to/footage --depth standard
+npx davinci-resolve-mcp batch run /path/to/footage --json > progress.log
+npx davinci-resolve-mcp batch status /path/to/analysis-root JOB_ID
+npx davinci-resolve-mcp batch resume /path/to/analysis-root JOB_ID
+```
+
+Use `batch list` or `batch cancel` for job management. The CLI exits `0` for a
+completed batch, `2` for a completed batch with clip errors, `3` for a fatal
+failure, and `130` when interrupted. For the offline Node server,
+`npx davinci-resolve-advanced-mcp --node-check` reports the Node executable
+that will actually serve the MCP connection, including automatic Node-floor
+self-healing.
+
 ## Server Modes
 
 | Mode | Entry point | Tools | Best for |

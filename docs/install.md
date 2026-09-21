@@ -53,7 +53,7 @@ Model weights carry their own licences, separate from the code that loads them.
 > (`brew install python@3.12`, `pyenv install 3.12`, or python.org on Windows) and
 > point the launcher at it with `DAVINCI_RESOLVE_MCP_PYTHON=/path/to/python3.12`.
 
-Validated live coverage is based on **DaVinci Resolve 19.1.3 Studio** for the original API surface, plus **DaVinci Resolve 20.3.2 Studio** for the Resolve 20.0-20.2.2 scripting additions. Resolve 21 beta APIs are intentionally deferred until a stable release.
+Validated live coverage is based on **DaVinci Resolve 19.1.3 Studio** for the original API surface, **DaVinci Resolve 20.3.2 Studio** for the Resolve 20 additions, and **DaVinci Resolve 21.0.2.4 Studio** for the Resolve 21 additions. Resolve 21 capabilities are runtime-gated, so older builds keep those actions unavailable rather than failing server startup. `AnalyzeForIntellisearch`, `AnalyzeForSlate`, and `GenerateSpeech` additionally require Resolve's separately downloaded AI Extras pack.
 
 ## Quick Start
 
@@ -127,6 +127,8 @@ npx davinci-resolve-mcp setup --clients all   # Configure all clients
 npx davinci-resolve-mcp doctor                # Dry-run environment/config check
 npx davinci-resolve-mcp server                # Launch the managed MCP server
 npx davinci-resolve-mcp control-panel         # Launch the local control panel
+npx davinci-resolve-mcp batch plan /path/to/footage
+npx davinci-resolve-mcp batch run /path/to/footage --json
 npx davinci-resolve-mcp sync                  # Refresh the managed install only
 
 python install.py                              # Interactive mode

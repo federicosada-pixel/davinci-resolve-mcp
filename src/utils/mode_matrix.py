@@ -184,6 +184,7 @@ def compare_repeated(name: str, gui_runs: List[Dict[str, Any]],
 
 def build_repeated_matrix(gui_stores: List[Dict[str, Dict[str, Any]]],
                           headless_stores: List[Dict[str, Dict[str, Any]]]) -> Dict[str, Any]:
+    """Compare repeated GUI and headless probe stores and aggregate verdicts."""
     names = sorted({n for store in gui_stores + headless_stores for n in store})
     findings = [
         compare_repeated(n,
@@ -247,6 +248,7 @@ def compare_probe(name: str, gui: Optional[Dict[str, Any]], headless: Optional[D
 
 
 def build_matrix(gui: Dict[str, Dict[str, Any]], headless: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Compare one GUI store with one headless store and aggregate verdicts."""
     names = sorted(set(gui) | set(headless))
     findings = [compare_probe(n, gui.get(n), headless.get(n)) for n in names]
     counts = {v: 0 for v in VERDICTS}
@@ -256,9 +258,12 @@ def build_matrix(gui: Dict[str, Dict[str, Any]], headless: Dict[str, Dict[str, A
 
 
 def actionable(matrix: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return findings that need attention, ordered by operational severity."""
     order = {v: i for i, v in enumerate(ACTIONABLE)}
     return sorted(
         (f for f in matrix["findings"] if f["verdict"] in order),
+        # Severity-first ordering makes the report actionable; probe name keeps
+        # equal-severity findings deterministic across runs.
         key=lambda f: (order[f["verdict"]], f["probe"]),
     )
 

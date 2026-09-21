@@ -2,13 +2,14 @@
 """
 DaVinci Resolve MCP Server (Compound Tools)
 
-37 compound tools covering 100% of the DaVinci Resolve Scripting API (336 methods)
-plus Fusion Fuse, DCTL, and Resolve-page Script authoring tools.
+Compound tools covering the DaVinci Resolve Scripting API plus guarded workflow
+helpers for media analysis, editing, grading, delivery, and extension authoring.
+The full server exposes the same API as one granular MCP tool per method.
 Each tool groups related operations via an 'action' parameter.
 
 Usage:
     python src/server.py              # Start the MCP server
-    python src/server.py --full       # Start the 377-tool granular server instead
+    python src/server.py --full       # Start the granular server instead
 """
 
 VERSION = "4.1.3"
