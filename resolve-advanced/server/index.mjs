@@ -75,6 +75,15 @@ const toError = (err) => ({
   content: [{ type: 'text', text: JSON.stringify({ error: err?.message || String(err) }, null, 2) }],
 });
 
+/**
+ * Register the offline tools and serve MCP requests over stdio.
+ *
+ * The server deliberately owns the stdio transport here rather than in each
+ * tool module. Keeping registration in one place ensures the library handlers
+ * and the spawned MCP process share exactly the same dispatch surface.
+ *
+ * @returns {Promise<void>} Resolves after the transport is connected.
+ */
 export async function startServer() {
   const server = new McpServer({ name: NAME, version: VERSION }, { capabilities: { tools: {} } });
 
