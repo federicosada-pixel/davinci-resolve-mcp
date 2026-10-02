@@ -28,6 +28,12 @@ from src.utils.app_control import (
     restart_resolve_app,
 )
 from src.utils.cdl import normalize_cdl_payload
+from src.utils.destructive_hook import granular_destructive_op
+from src.utils.confirm_tokens import (
+    ConfirmTokenStore,
+    gate_required_from,
+    plain_error as plain_confirm_error,
+)
 from src.utils.cloud_operations import (
     create_cloud_project,
     import_cloud_project,
@@ -87,7 +93,7 @@ if not logging.getLogger().handlers:
         handlers=[logging.StreamHandler()],
     )
 
-VERSION = "2.210.0"
+VERSION = "4.8.20"
 logger = logging.getLogger("davinci-resolve-mcp")
 logger.info(f"Starting DaVinci Resolve MCP Server v{VERSION}")
 logger.info(f"Detected platform: {get_platform()}")
@@ -95,6 +101,8 @@ logger.info(f"Using Resolve API path: {RESOLVE_API_PATH}")
 logger.info(f"Using Resolve library path: {RESOLVE_LIB_PATH}")
 
 mcp = FastMCP("DaVinciResolveMCP")
+if hasattr(mcp, "_mcp_server"):
+    mcp._mcp_server.version = VERSION
 
 READ_ONLY_TOOL = ToolAnnotations(
     readOnlyHint=True,
@@ -140,65 +148,112 @@ EXTERNAL_DESTRUCTIVE_TOOL = ToolAnnotations(
 )
 
 
+#: Namespace segments that sit in FRONT of the verb in a granular tool name.
+#:
+#: The prefix heuristic below reads the leading verb, so a tool called
+#: `ti_delete_marker_at_frame` matched none of the verb lists and fell through to
+#: the plain write default — 86 tools were mis-hinted this way, 43 destructive ones
+#: advertised as ordinary writes (a client gating on `destructiveHint` was told
+#: `ti_copy_grades` was safe) and 43 pure readers advertised as writes. Every tool
+#: carrying one of these is `<namespace>_<verb>_...`, so one strip exposes the verb.
+NAMESPACE_PREFIXES = (
+    "ti_",
+    "timeline_",
+    "graph_",
+    "folder_",
+)
+
+
+def _strip_namespace(name: str) -> str:
+    """Drop one leading namespace segment so the verb heuristic can see the verb."""
+    for prefix in NAMESPACE_PREFIXES:
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _verb_probe(tool_name: str) -> str:
+    """The stripped name, shaped so a BARE verb still matches its prefix.
+
+    Every verb prefix ends in "_", so `timeline_export` -> `export` would match
+    nothing: the tool name is exactly `<namespace>_<verb>` with no suffix. The
+    trailing "_" makes `export` match `export_` without loosening anything else.
+    """
+    return _strip_namespace((tool_name or "").lower()) + "_"
+
+
+#: Verb prefixes, checked in this order against the name AFTER its namespace is
+#: stripped. Module-level so `tests/test_granular_tool_annotations.py` can tell a
+#: deliberate write from a name that matched nothing and fell through to the default.
+READ_PREFIXES = (
+    "get_",
+    "list_",
+    "inspect_",
+    "probe_",
+    "validate_",
+    "compare_",
+    # NOT "detect_": Timeline.DetectSceneCuts adds cuts to the timeline, and the
+    # compound server rates detect_scene_cuts destructive. It only ever looked like
+    # a read because the `timeline_` namespace hid it from this list.
+    "summarize_",
+    "review_",
+    "is_",
+    "has_",
+)
+DESTRUCTIVE_PREFIXES = (
+    "delete_",
+    "remove_",
+    "clear_",
+    "reset_",
+    "replace_",
+    "unlink_",
+    "quit",
+    "restart",
+    "close_",
+    "stop_",
+    "overwrite_",
+    "lift_",
+    "set_",
+    "load_",
+    "switch_",
+)
+WRITE_PREFIXES = (
+    "add_",
+    "append_",
+    "apply_",
+    "assign_",
+    "copy_",
+    "create_",
+    "duplicate_",
+    "export_",
+    "import_",
+    "insert_",
+    "link_",
+    "move_",
+    "open_",
+    "render_",
+    "rename_",
+    "save_",
+    "start_",
+    "sync_",
+    "transcribe_",
+)
+
+
+def matches_a_verb(tool_name: str) -> bool:
+    """Did the name resolve to a verb rule, or fall through to the default?"""
+    return _verb_probe(tool_name).startswith(
+        READ_PREFIXES + DESTRUCTIVE_PREFIXES + WRITE_PREFIXES)
+
+
 def _annotations_for_tool_name(tool_name: str) -> ToolAnnotations:
     """Infer conservative MCP client-safety hints for legacy granular tools."""
-    name = (tool_name or "").lower()
-    read_prefixes = (
-        "get_",
-        "list_",
-        "inspect_",
-        "probe_",
-        "validate_",
-        "compare_",
-        "detect_",
-        "summarize_",
-        "review_",
-        "is_",
-        "has_",
-    )
-    destructive_prefixes = (
-        "delete_",
-        "remove_",
-        "clear_",
-        "reset_",
-        "replace_",
-        "unlink_",
-        "quit",
-        "restart",
-        "close_",
-        "stop_",
-        "overwrite_",
-        "lift_",
-        "set_",
-        "load_",
-        "switch_",
-    )
-    write_prefixes = (
-        "add_",
-        "append_",
-        "apply_",
-        "assign_",
-        "copy_",
-        "create_",
-        "duplicate_",
-        "export_",
-        "import_",
-        "insert_",
-        "link_",
-        "move_",
-        "open_",
-        "render_",
-        "rename_",
-        "save_",
-        "start_",
-        "sync_",
-        "transcribe_",
-    )
-    if name.startswith(read_prefixes):
+    name = _verb_probe(tool_name)
+    if name.startswith(READ_PREFIXES):
         return READ_ONLY_TOOL
-    if name.startswith(destructive_prefixes):
+    if name.startswith(DESTRUCTIVE_PREFIXES):
         return DESTRUCTIVE_TOOL
-    if name.startswith(write_prefixes):
+    if name.startswith(WRITE_PREFIXES):
         return WRITE_TOOL
     return WRITE_TOOL
 
@@ -242,16 +297,13 @@ _OPTIONAL_DEPENDENCY_CONTRACT = (
     "DaVinciResolveScript: always routed through connect_resolve(), which is None-tolerant"
 )
 
+# Loading the module is not connecting. `scriptapp` is what reaches a running
+# Resolve, and it waits for `connect_at_startup()` or the first `get_resolve()`.
+# Connecting here made *importing* this module talk to whatever Resolve was
+# open, including from the offline test suite, where any `import src.granular.*`
+# connected before a single test could stop it.
 try:
     import DaVinciResolveScript as dvr_script  # type: ignore
-
-    resolve = connect_resolve(dvr_script)
-    if resolve:
-        logger.info(
-            f"Connected to DaVinci Resolve: {resolve.GetProductName()} {resolve.GetVersionString()}"
-        )
-    else:
-        logger.error("Failed to get Resolve object. Is DaVinci Resolve running?")
 except ImportError as exc:
     logger.error(f"Failed to import DaVinciResolveScript: {exc}")
     logger.error("Check that DaVinci Resolve is installed and running.")
@@ -259,10 +311,38 @@ except ImportError as exc:
     logger.error(f"RESOLVE_SCRIPT_LIB: {RESOLVE_LIB_PATH}")
     logger.error(f"RESOLVE_MODULES_PATH: {RESOLVE_MODULES_PATH}")
     logger.error(f"sys.path: {sys.path}")
-    resolve = None
+    dvr_script = None
 except Exception as exc:
     logger.error(f"Unexpected error initializing Resolve: {exc}")
-    resolve = None
+    dvr_script = None
+
+
+def connect_at_startup():
+    """Connect to a running Resolve as the granular server starts, and log it.
+
+    This is the connection that used to run at import. The launchers
+    (`src/resolve_mcp_server.py` and `src/server.py --full`) call it right after
+    importing the package, so starting the server behaves as before: it
+    connects to a Resolve that is already open and never launches one. Launching
+    is still left to `get_resolve()` on the first tool call. A missing
+    DaVinciResolveScript was already reported above and skips the attempt, as
+    the import failure did before.
+    """
+    global resolve
+    if dvr_script is None:
+        return None
+    try:
+        resolve = connect_resolve(dvr_script)
+        if resolve:
+            logger.info(
+                f"Connected to DaVinci Resolve: {resolve.GetProductName()} {resolve.GetVersionString()}"
+            )
+        else:
+            logger.error("Failed to get Resolve object. Is DaVinci Resolve running?")
+    except Exception as exc:
+        logger.error(f"Unexpected error initializing Resolve: {exc}")
+        resolve = None
+    return resolve
 
 
 def _normalize_cdl(cdl):
@@ -289,13 +369,15 @@ class ResolveProxy:
 def _resolve_safe_dir(path):
     """Redirect sandbox/temp paths that Resolve can't access to ~/Desktop/resolve-stills.
 
-    Covers macOS (/var/folders, /private/var), Linux (/tmp, /var/tmp),
-    and Windows (AppData\\Local\\Temp) sandbox temp directories.
+    Covers macOS (/var/folders, /private/var, /tmp, /private/tmp), Linux (/tmp,
+    /var/tmp), and Windows (AppData\\Local\\Temp) sandbox temp directories.
     """
     system_temp = tempfile.gettempdir()
     _is_sandbox = False
     if platform.system() == "Darwin":
-        _is_sandbox = path.startswith("/var/") or path.startswith("/private/var/")
+        # /tmp is a symlink to /private/tmp on macOS; Resolve's exporters fail
+        # silently into both, same as /var/folders (matches src/server.py).
+        _is_sandbox = path.startswith(("/var/", "/private/var/", "/tmp/", "/private/tmp/")) or path in ("/tmp", "/private/tmp")
     elif platform.system() == "Linux":
         _is_sandbox = path.startswith("/tmp") or path.startswith("/var/tmp")
     elif platform.system() == "Windows":
@@ -753,7 +835,9 @@ def _get_timeline_item(track_type="video", track_index=1, item_index=0):
     if err:
         return None, err
     items = tl.GetItemListInTrack(track_type, track_index)
-    if not items or item_index >= len(items):
+    # Reject negatives: `items[-1]` is the LAST clip, so a negative index would
+    # act on a clip nobody named (EX5 fixed the compound `_get_item`, not this twin).
+    if not items or item_index < 0 or item_index >= len(items):
         return None, {"error": f"No item at index {item_index} on {track_type} track {track_index}"}
     return items[item_index], None
 
@@ -796,5 +880,51 @@ def _ai_result_payload(returned):
     if message:
         payload["error"] = message
     return payload
+
+
+# ── Confirmation gate ────────────────────────────────────────────────────────
+#
+# The granular server is a separate process from the compound one, so it holds its
+# own token table; a token minted here is not honoured there and vice versa. What
+# is shared is the implementation and the on/off policy, from
+# src/utils/confirm_tokens.py — the granular tools return plain dicts rather than
+# the compound envelope, so the error builder is the plain one.
+
+_MEDIA_ANALYSIS_PREFS_ENV = "DAVINCI_RESOLVE_MCP_MEDIA_ANALYSIS_PREFS"
+
+
+def _media_analysis_preferences():
+    """Read the same preferences file the compound server and setup write."""
+    import json
+
+    override = os.environ.get(_MEDIA_ANALYSIS_PREFS_ENV)
+    if override:
+        path = os.path.realpath(os.path.abspath(os.path.expanduser(override)))
+    else:
+        path = os.path.join(PROJECT_DIR, "logs", "media-analysis-preferences.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _confirm_token_required() -> bool:
+    """Honor the setup default destructive.require_confirm_token (default True)."""
+    try:
+        prefs = _media_analysis_preferences()
+    except Exception:
+        prefs = {}
+    return gate_required_from(prefs)
+
+
+CONFIRM_TOKENS = ConfirmTokenStore(
+    err=plain_confirm_error,
+    # Resolved per call so the preference can be changed without a server restart,
+    # and so tests can patch the module-level function.
+    required=lambda: _confirm_token_required(),
+)
+
 
 __all__ = [name for name in globals() if not name.startswith("__")]

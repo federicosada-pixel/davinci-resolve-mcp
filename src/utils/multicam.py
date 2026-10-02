@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from src.utils.bool_params import coerce_bool
+
 
 FindClip = Callable[[Any, str], Any]
 
@@ -97,6 +99,55 @@ def timecode_to_frames(timecode: Any, fps: Any, *, drop_frame: Optional[bool] = 
         total_minutes = hh * 60 + mm
         total -= drop_frames * (total_minutes - total_minutes // 10)
     return total
+
+
+def frames_to_timecode(frame: Any, fps: Any, *, drop_frame: bool = False) -> Optional[str]:
+    """Convert a frame count back to HH:MM:SS:FF timecode.
+
+    The exact inverse of `timecode_to_frames`, and it lives next to it so the
+    pair cannot drift apart: a frames->timecode helper written on its own
+    reliably forgets that drop-frame dropped frame NUMBERS on the way in, and
+    then reports a timecode 3.6 seconds early per hour.
+
+    `drop_frame` renders drop-frame timecode (semicolon separator) at the two
+    nominal rates where it is defined, 30 and 60; at any other rate it is
+    ignored, exactly as `timecode_to_frames` ignores a semicolon there.
+    """
+    rate = parse_frame_rate(fps)
+    if rate is None:
+        return None
+    try:
+        frame = max(0, int(frame))
+    except (TypeError, ValueError):
+        return None
+    nominal = _nominal_timecode_rate(rate)
+    if nominal <= 0:
+        return None
+
+    if drop_frame and nominal in (30, 60):
+        # Two (30) or four (60) frame numbers are skipped at the top of every
+        # minute except every tenth, so a ten-minute block holds one full
+        # minute and nine short ones.
+        drop = 2 if nominal == 30 else 4
+        per_minute = nominal * 60 - drop
+        per_ten = per_minute * 10 + drop
+        tens, rem = divmod(frame, per_ten)
+        if rem < nominal * 60:
+            minutes = tens * 10
+            frame_in_minute = rem
+        else:
+            rem -= nominal * 60
+            extra_minutes, frame_in_minute = divmod(rem, per_minute)
+            minutes = tens * 10 + 1 + extra_minutes
+            frame_in_minute += drop
+        hours, minutes = divmod(minutes, 60)
+        seconds, frames = divmod(frame_in_minute, nominal)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d};{frames:02d}"
+
+    hours, remainder = divmod(frame, nominal * 3600)
+    minutes, remainder = divmod(remainder, nominal * 60)
+    seconds, frames = divmod(remainder, nominal)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames:02d}"
 
 
 def _get_clip_property_map(clip: Any) -> Dict[str, Any]:
@@ -274,8 +325,8 @@ def build_multicam_setup_plan(root: Any, params: Dict[str, Any], find_clip: Find
     if not sync_mode:
         return None, _err("sync_mode must be stack_start, record_frame, or source_timecode")
 
-    include_video = bool(params.get("include_video", params.get("includeVideo", True)))
-    include_audio = bool(params.get("include_audio", params.get("includeAudio", False)))
+    include_video = coerce_bool(params.get("include_video", params.get("includeVideo")), True)
+    include_audio = coerce_bool(params.get("include_audio", params.get("includeAudio")), False)
     if not include_video and not include_audio:
         return None, _err("At least one of include_video or include_audio must be true")
     audio_mode = _normalize_audio_mode(params.get("audio_track_mode", params.get("audioTrackMode")), include_audio)
@@ -298,7 +349,7 @@ def build_multicam_setup_plan(root: Any, params: Dict[str, Any], find_clip: Find
     angles: List[Dict[str, Any]] = []
     max_video_track = 0
     max_audio_track = 0
-    allow_negative = bool(params.get("allow_negative_record_frame", params.get("allowNegativeRecordFrame", False)))
+    allow_negative = coerce_bool(params.get("allow_negative_record_frame", params.get("allowNegativeRecordFrame")), False)
     record_frame_mode = params.get("record_frame_mode", params.get("recordFrameMode", "relative"))
 
     for index, raw in enumerate(raw_angles):

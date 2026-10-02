@@ -83,6 +83,11 @@ def _drive_to_completion(
     max_seconds: Optional[float],
     json_mode: bool,
 ) -> int:
+    """Run resumable analysis slices until the job reaches a terminal state.
+
+    Progress is emitted after each slice so callers can use this function from
+    a terminal or CI job without waiting for the entire batch to finish.
+    """
     signal.signal(signal.SIGINT, _on_sigint)
     while True:
         if _canceled:
@@ -527,6 +532,7 @@ _HANDLERS = {
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """Parse batch-CLI arguments, dispatch the command, and return its exit code."""
     from src.utils import actor_identity
     actor_identity.set_instance("batch-cli")
     parser = _build_parser()

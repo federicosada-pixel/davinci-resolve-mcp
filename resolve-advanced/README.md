@@ -79,10 +79,30 @@ Each dispatches on an `action`. Highlights:
 - **`drx`** — per-clip grade (`.drx`) codec: `parse`, `generate`, `generate_from_request`,
   `export_cdl`, `merge`, plus the **grading/QC catalog** below.
 - **`drp` / `drt`** — project / timeline file authoring + editing + grade injection + structural diff.
+  `drp` `relayout_node_graphs` is the whole-project **Cleanup Node Graph** (the UI command has
+  no API): every node graph an exported `.drp` carries — every LOCAL version of every clip,
+  remote versions, group pre/post, timeline-level — relaid out to Resolve's clean row with the
+  grade bytes untouched and `HasCorrection` as found; scoped by timeline / track / clip id /
+  name / media / frame range / clip position / color group / version / node count / node
+  label; dry-run report, read-back verify. Round trip: `export_project` → `relayout_node_graphs`
+  → `import_project` as a sibling. Single `.drx`: `drx` `relayout`; closed `Project.db`:
+  `project_db` `relayout_node_graphs`. All three are topology-aware: nodes rank by their
+  RGB wiring (chain order, not list order), branches stack into lanes, key links stay put;
+  `layout: row` is the old single-row mode.
 - **`conform`** — offline conform/relink QC engine (frame-oracle math, not filename matching),
   reverse-clip DB repair, sequence lineage store + diff, per-cut frame QC (sampled clear of
   transition windows; ingests Resolve's own FCP7 export — `-1` edges → junctions, no ticks needed).
-- **`color_trace`** — cross-project clip matching → a trace plan for carrying grades across a re-conform.
+- **`color_trace`** — a ColorTrace that works: matches a graded SOURCE timeline against a TARGET
+  timeline (any two projects, from `Project.db`, read-only, no Resolve) on **media identity** —
+  pool item id / file path / reel / file name plus source-range overlap, so a stringout cut into
+  graded sections, a renamed clip, or relinked media still traces; clip names are the last resort.
+  Either side is a `Project.db` (`…ProjectDb` / `…ProjectName`) **or an exported `.drp`**
+  (`sourceDrp` / `targetDrp`) — the `.drp` route is how a Postgres / network / cloud library
+  is read, since `ProjectManager.ExportProject` works on any project by name without loading
+  it. Emits one lossless `.drx` per graded match plus a `plan.json`; the live server's
+  `timeline_item_color.apply_trace_plan` applies it (dry-run resolution table, one
+  confirm_token for the batch, timeline archived first, full per-clip report to a file).
+  Live-validated 2026-09-08: 878-clip conform, 254 grades carried, 0 failures.
 - **`project_read` / `project_db`** — read/patch the Resolve project DB (SQLite or Postgres).
   Includes `list_subtitle_styles` / `set_subtitle_style` — caption font family/size/weight/italic
   and normalised position, which the scripting API cannot touch at all. Whole-track (not

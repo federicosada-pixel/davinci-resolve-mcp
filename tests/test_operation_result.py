@@ -199,10 +199,38 @@ class Verification(unittest.TestCase):
             "property_restore_failures": 2, "properties_restored_items": 5})
         self.assertEqual(v["status"], "partial")
 
-    def test_bulk_counts_become_a_check(self):
-        v = extract_verification({"succeeded": 2, "failed": 1})
-        self.assertEqual(v["status"], "partial")
-        self.assertEqual(v["checks"][0]["check"], "bulk_operations")
+    def test_bulk_counts_do_not_establish_verification(self):
+        for succeeded, failed in ((3, 0), (2, 1), (0, 3)):
+            v = extract_verification({"succeeded": succeeded, "failed": failed})
+            self.assertEqual(v["status"], "unverified")
+            self.assertEqual(v["checks"], [])
+
+    def test_later_pass_does_not_erase_failed_readback(self):
+        v = extract_verification({"readback": {"missing": ["clip"]}, "verified": True})
+        self.assertEqual(v["status"], "failed")
+
+    def test_explicit_pass_does_not_hide_failed_check(self):
+        v = extract_verification({"verification": {"status": "passed", "checks": [{"passed": False}]}})
+        self.assertEqual(v["status"], "failed")
+
+    def test_explicit_pass_does_not_hide_contradiction(self):
+        v = extract_verification({"verification": {"status": "passed"}, "contradiction": True})
+        self.assertEqual(v["status"], "contradiction")
+
+    def test_bulk_counts_cannot_mask_a_failed_readback(self):
+        # A bulk tool that tallied every command as sent, while the readback
+        # found one of the targets missing, must read failed — the tally is
+        # what we sent, the readback is what Resolve kept.
+        v = extract_verification({"succeeded": 3, "failed": 0,
+                                  "readback": {"missing": ["clip_2"]}})
+        self.assertEqual(v["status"], "failed")
+        self.assertEqual([c["check"] for c in v["checks"]], ["readback_verification"])
+
+    def test_readback_evidence_is_what_passes_a_bulk_result(self):
+        v = extract_verification({"succeeded": 3, "failed": 0,
+                                  "readback": {"missing": []}})
+        self.assertEqual(v["status"], "passed")
+        self.assertFalse(v["contradiction"])
 
     def test_an_impl_that_already_speaks_the_shape_wins(self):
         v = extract_verification({"verification": {"status": "passed", "checks": [{"check": "x"}]}})

@@ -11,6 +11,7 @@ from __future__ import annotations
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -20,6 +21,13 @@ from src.utils import knowledge  # noqa: E402
 
 
 class TestIndex(unittest.TestCase):
+    def test_topic_matcher_is_compiled_once_per_index(self):
+        with mock.patch.object(
+            knowledge, "_topic_pattern", wraps=knowledge._topic_pattern
+        ) as topic_pattern:
+            knowledge._build_index()
+        self.assertEqual(topic_pattern.call_count, 1)
+
     def test_every_topic_resolves_to_content(self):
         for record in knowledge.topics():
             with self.subTest(topic=record["topic"]):

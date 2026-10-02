@@ -54,7 +54,7 @@ import difflib
 import math
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Pattern, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILLS_DIR = REPO_ROOT / ".agents" / "skills"
@@ -295,12 +295,35 @@ def _build_index() -> Dict[str, Dict[str, Any]]:
             "body": body.strip(),
         }
 
+    topic_names = tuple(sorted(index))
+    topic_lookup = {name.lower(): name for name in topic_names}
+    pattern = _topic_pattern(topic_names)
     for record in index.values():
-        record["related"] = _related_topics(record, index)
+        record["related"] = _related_topics(
+            record,
+            index,
+            topic_names=topic_names,
+            topic_lookup=topic_lookup,
+            pattern=pattern,
+        )
     return index
 
 
-def _related_topics(record: Dict[str, Any], index: Dict[str, Dict[str, Any]]) -> List[str]:
+def _topic_pattern(topic_names: Tuple[str, ...]) -> Optional[Pattern[str]]:
+    if not topic_names:
+        return None
+    alternation = "|".join(re.escape(name) for name in topic_names)
+    return re.compile(rf"(?<!\w)(?:{alternation})(?!\w)", flags=re.IGNORECASE)
+
+
+def _related_topics(
+    record: Dict[str, Any],
+    index: Dict[str, Dict[str, Any]],
+    *,
+    topic_names: Optional[Tuple[str, ...]] = None,
+    topic_lookup: Optional[Dict[str, str]] = None,
+    pattern: Optional[Pattern[str]] = None,
+) -> List[str]:
     """Topics this one points at: linked docs first, then topics named in the body."""
     by_path = {other["path"]: other["topic"] for other in index.values()}
     related: List[str] = []
@@ -308,10 +331,24 @@ def _related_topics(record: Dict[str, Any], index: Dict[str, Dict[str, Any]]) ->
         topic = by_path.get(reference)
         if topic and topic != record["topic"] and topic not in related:
             related.append(topic)
-    for topic in sorted(index):
+    topic_names = topic_names if topic_names is not None else tuple(sorted(index))
+    if not topic_names:
+        return related
+
+    topic_lookup = topic_lookup or {name.lower(): name for name in topic_names}
+    compiled_pattern = pattern or _topic_pattern(topic_names)
+    if compiled_pattern is None:
+        return related
+    matches: set[str] = set()
+    for match in compiled_pattern.finditer(record["body"]):
+        canonical = topic_lookup.get(match.group(0).lower())
+        if canonical:
+            matches.add(canonical)
+
+    for topic in topic_names:
         if topic == record["topic"] or topic in related:
             continue
-        if re.search(rf"\b{re.escape(topic)}\b", record["body"]):
+        if topic in matches:
             related.append(topic)
     return related
 

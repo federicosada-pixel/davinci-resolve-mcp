@@ -24,6 +24,9 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from src.utils import operation_log
+from src.utils.bool_params import coerce_bool
+
 logger = logging.getLogger("resolve-mcp.execution-lifecycle")
 
 
@@ -123,22 +126,31 @@ class RiskClassificationHook(LifecycleHook):
     name = "risk_classification"
 
     _CRITICAL_ACTIONS: Set[Tuple[str, str]] = {
-        ("project_manager", "delete_project"),
-        ("project_manager", "close_project_without_saving"),
+        # Raw project delete. This rule used to name `delete_project`, which
+        # no tool dispatches, so it matched nothing and deleting a project
+        # passed every gate.
+        ("project_manager", "delete"),
         ("media_pool", "delete_timelines"),
         ("media_pool", "delete_clips"),
     }
 
     _HIGH_RISK_ACTIONS: Set[Tuple[str, str]] = {
+        # Plugin-folder deletes. A bare `remove` misses the `remove_` prefix
+        # rule below, so these were unrecognised and every gate read them as
+        # reads. `safe_remove_extension` unlinks directly rather than through
+        # the per-tool `remove`, so it needs its own entry.
+        ("dctl", "remove"),
+        ("fuse_plugin", "remove"),
+        ("script_plugin", "remove"),
+        ("script_plugin", "safe_remove_extension"),
+        # LUT deletes. Confined to the MCP/ subfolder, but permanent, and the
+        # file may be applied on a node in some open project.
+        ("lut", "remove"),
+        # Guarded delete: disposable `_mcp_` projects only, and the open one
+        # only with close_current=True — but still permanent.
+        ("project_manager", "safe_project_delete"),
         ("timeline", "delete_clips"),
-        ("timeline", "delete_clip_by_id"),
-        ("timeline", "delete_markers"),
-        ("timeline", "ripple_delete"),
-        ("timeline", "cut_clip"),
         ("edit_engine", "execute_selects"),
-        ("edit_engine", "auto_cut_silence"),
-        ("edit_engine", "ripple_trim"),
-        ("project_manager", "save_project_as"),
         ("media_pool", "delete_folders"),
         ("timeline", "delete_track"),
         ("timeline", "lift_range"),
@@ -169,6 +181,9 @@ class RiskClassificationHook(LifecycleHook):
         # CopyGrades overwrites each target's grade.
         ("graph", "apply_grade_from_drx"),
         ("timeline_item_color", "copy_grades"),
+        # apply_trace_plan runs ApplyGradeFromDRX over every clip a color_trace
+        # plan resolved — one confirm_token, N replaced graphs.
+        ("timeline_item_color", "apply_trace_plan"),
         # Takes. delete removes one; finalize collapses the item to the selected
         # take and discards the rest.
         ("timeline_item_takes", "delete"),
@@ -188,6 +203,10 @@ class RiskClassificationHook(LifecycleHook):
     #: them unrecognised, i.e. it warns that the risk is unestablished for the
     #: actions whose risk is the best established of any we dispatch.
     _LOW_RISK_ACTIONS: Set[Tuple[str, str]] = {
+        # Attaching a modifier to one Fusion input: one undo step, and
+        # disconnect(tool, input) removes it. (#250)
+        ("fusion_comp", "add_modifier"),
+        ("dctl", "encrypt_native"),  # Creates a new file; never replaces existing content.
         ("timeline_markers", "add"),
         ("timeline_markers", "update_custom_data"),
         ("timeline_item_markers", "add"),
@@ -242,6 +261,30 @@ class RiskClassificationHook(LifecycleHook):
     #: MEDIUM was overwhelmingly the `else` fallthrough, which made an assessed
     #: MEDIUM and an unrated action indistinguishable by level alone.
     _MEDIUM_RISK_ACTIONS: Set[Tuple[str, str]] = {
+        # Plugin-folder installs: a new file, or a replaced one with
+        # overwrite=true, that Resolve or Fusion will later load and run.
+        # MEDIUM, not HIGH: audited and dry-run-honest, but not blocked by
+        # safe mode, in line with the other create-style writes.
+        ("dctl", "install"),
+        ("fuse_plugin", "install"),
+        ("script_plugin", "install"),
+        ("script_plugin", "safe_install_extension"),
+        # LUT installs write into the folder Resolve loads LUTs from, like the
+        # plugin installs above. `install` can replace with overwrite=true;
+        # `attenuate` refuses an existing destination but writes the same tree.
+        ("lut", "install"),
+        ("lut", "attenuate"),
+        # Project archive. Writes only a new path (an existing file or folder
+        # at the target was never touched in any measured case), but the two
+        # media flags crash Resolve 21.1.0.14 and lose unsaved work; the
+        # wrappers refuse those unless acknowledge_trap. See archive_guard.py.
+        ("project_manager", "archive"),
+        ("project_manager", "safe_project_archive"),
+        # 21.0 AI deblur renders NEW media and never touches the source (it is
+        # confirm-token gated for that reason). The `remove_` prefix rule rated
+        # it HIGH on its name alone, which would make safe mode block a create.
+        ("folder", "remove_motion_blur"),
+        ("media_pool_item", "remove_motion_blur"),
         # Additive edits that place content into an existing timeline. Nothing
         # is deleted (`overwrite_range`, which does delete, is HIGH), but the
         # timeline is no longer what it was.
@@ -266,6 +309,20 @@ class RiskClassificationHook(LifecycleHook):
         # whatever the caller passed; `set_retime` changes duration and sync.
         ("timeline_item", "set_property"),
         ("timeline_item", "set_retime"),
+        # Native 21.1 setters (#208): `set_speed` changes duration and, with
+        # RippleTimeline true, moves every clip after it; `set_fades` rewrites
+        # how the clip's edges render. Existing content altered, not deleted.
+        ("media_pool", "create_multicam_clip"),
+        ("timeline", "auto_align_clips"),
+        ("timeline_item", "flatten_multicam"),
+        ("timeline", "set_output_blanking"),
+        ("timeline_item", "set_output_blanking"),
+        ("timeline_item", "set_use_timeline_for_output_blanking"),
+
+        ("timeline", "normalize_audio_level"),
+        ("timeline_item", "add_transition"),
+        ("timeline_item", "set_speed"),
+        ("timeline_item", "set_fades"),
         # Pool reorganisation: clips and bins move, nothing is destroyed, but
         # paths other work depends on change underneath it.
         ("media_pool", "move_clips"),
@@ -287,14 +344,51 @@ class RiskClassificationHook(LifecycleHook):
         ("timeline_item_color", "smart_reframe"),
         ("timeline_item_color", "create_magic_mask"),
         ("timeline_item_color", "regenerate_magic_mask"),
-        ("graph", "set_lut"),
-        ("graph", "apply_arri_cdl_lut"),
         # Importing or switching the active comp changes what renders.
         ("timeline_item_fusion", "import_comp"),
         ("timeline_item_fusion", "load_comp"),
     }
 
+    #: Raw graph LUT writes. Their level follows the graph they target (see
+    #: `_graph_scope`): MEDIUM on one item, HIGH on the timeline graph (the
+    #: tool's DEFAULT) or a color-group graph, where one call restyles every
+    #: clip on the timeline or in the group. Adapted from PR #192.
+    _GRAPH_LUT_ACTIONS: Set[Tuple[str, str]] = {
+        ("graph", "set_lut"),
+        ("graph", "apply_arri_cdl_lut"),
+    }
+
+    @staticmethod
+    def _graph_scope(params: Dict[str, Any]) -> Tuple["BlastRadius", str]:
+        """Blast radius of a `graph` tool call, from its `source` param.
+
+        The graph tool resolves `source` as "timeline" (default) ->
+        Timeline.GetNodeGraph(), "item" -> TimelineItem.GetNodeGraph(), and
+        "color_group_pre"/"color_group_post" -> the group's pre/post clip
+        graph. Every graph mutation — LUT, DRX apply, reset, node toggle —
+        lands on whichever graph that names, so the scope is a property of
+        the call, not of the action, and a rating that says "item" for a
+        reset of a color-group graph is wrong by the size of the group.
+        """
+        source = str(params.get("source") or "timeline")
+        if source == "item":
+            return BlastRadius.ITEM, "one timeline item's graph"
+        if source in {"color_group_pre", "color_group_post"}:
+            return (
+                BlastRadius.PROJECT,
+                f"a color group's {source} graph (every clip in the group)",
+            )
+        return BlastRadius.TIMELINE, "the timeline node graph (every clip on the timeline)"
+
     _READ_ONLY_PREFIXES = ("get_", "list_", "query_", "probe_", "inspect_", "export_", "check_")
+    #: Reads whose action name carries no read verb. Without an entry here a
+    #: pure read falls to the name-based MEDIUM default and every call reports
+    #: "risk unestablished" — noise on the one call an agent makes before
+    #: planning (project_manager.snapshot, #251).
+    _READ_ONLY_PAIRS = frozenset({
+        ("dctl", "validate_native"),
+        ("project_manager", "snapshot"),
+    })
 
     @classmethod
     def classify(cls, tool_name: str, action: str, params: Dict[str, Any]) -> RiskAssessment:
@@ -313,20 +407,46 @@ class RiskClassificationHook(LifecycleHook):
             radius = BlastRadius.PROJECT if "project" in tool_name else BlastRadius.TIMELINE
             conf_required = True
             reasons.append(f"Action '{action}' is permanently destructive across {radius.value}")
-        elif pair in cls._HIGH_RISK_ACTIONS or action.startswith("delete_") or action.startswith("remove_"):
+        elif pair in cls._HIGH_RISK_ACTIONS or (
+            # The name-prefix rule is a fallback for UNLISTED actions: an
+            # explicit lower rating wins. It used to fire first and so could
+            # not be overridden — `remove_motion_blur` creates media, yet read
+            # HIGH on its name.
+            pair not in cls._LOW_RISK_ACTIONS
+            and pair not in cls._MEDIUM_RISK_ACTIONS
+            and pair not in cls._GRAPH_LUT_ACTIONS
+            and (action.startswith("delete_") or action.startswith("remove_"))
+        ):
             level = RiskLevel.HIGH
             destructive = True
-            if params.get("ripple", False):
+            if coerce_bool(params.get("ripple")):
                 radius = BlastRadius.TIMELINE
                 reasons.append("Ripple mode alters downstream timeline synchronization")
+            elif tool_name == "graph":
+                radius, scope = cls._graph_scope(params)
+                reasons.append(f"Graph target: {scope}")
             else:
                 radius = BlastRadius.ITEM
             conf_required = True
             reasons.append(f"Destructive timeline edit: {action}")
+        elif pair in cls._GRAPH_LUT_ACTIONS:
+            destructive = True
+            radius, scope = cls._graph_scope(params)
+            if radius is BlastRadius.ITEM:
+                level = RiskLevel.MEDIUM
+                reasons.append(f"Raw graph LUT write '{action}' is scoped to {scope}")
+            else:
+                level = RiskLevel.HIGH
+                conf_required = True
+                reasons.append(f"Raw graph LUT write '{action}' targets {scope}")
         elif pair in cls._LOW_RISK_ACTIONS:
             level = RiskLevel.LOW
             destructive = True
-            radius = BlastRadius.ITEM
+            if tool_name == "graph":
+                radius, scope = cls._graph_scope(params)
+                reasons.append(f"Graph target: {scope}")
+            else:
+                radius = BlastRadius.ITEM
             reasons.append(f"Bounded reversible edit: {action}")
         elif pair in cls._MEDIUM_RISK_ACTIONS:
             level = RiskLevel.MEDIUM
@@ -339,7 +459,7 @@ class RiskClassificationHook(LifecycleHook):
                 else BlastRadius.ITEM
             )
             reasons.append(f"Recoverable edit to existing state: {action}")
-        elif any(action.startswith(p) for p in cls._READ_ONLY_PREFIXES) or action in {"read", "status", "info"}:
+        elif any(action.startswith(p) for p in cls._READ_ONLY_PREFIXES) or action in {"read", "status", "info"} or pair in cls._READ_ONLY_PAIRS:
             level = RiskLevel.LOW
             destructive = False
             radius = BlastRadius.ITEM
@@ -439,8 +559,43 @@ class DriftDetectionHook(LifecycleHook):
         "delete_clips", "cut_clip", "delete_item", "ripple_trim"
     }
 
+    #: Identity keys that make a duration comparable. If either of these moved,
+    #: the two durations describe different timelines and their difference is
+    #: not drift.
+    _IDENTITY_KEYS = ("project_name", "timeline_name")
+
     def __init__(self, state_provider: Optional[Callable[[], Optional[Dict[str, Any]]]] = None):
         self._state_provider = state_provider
+
+    @classmethod
+    def _baseline_identity_changed(
+        cls, pre_state: Dict[str, Any], post_state: Dict[str, Any]
+    ) -> Optional[str]:
+        """Name the identity key that moved, or None if the baseline still holds.
+
+        A duration delta only means drift when both numbers describe the same
+        timeline. Actions that *replace* the current timeline rather than modify
+        it -- `project_manager.load` most obviously -- leave a pre-state
+        measuring one project's timeline and a post-state measuring another's.
+        Comparing them reports a large unexpected drift for a call during which
+        nothing was edited at all.
+
+        That is the failure this layer exists to prevent, occurring inside the
+        layer itself: the README is explicit that a confident wrong answer is
+        worse than no answer, and an agent reading the envelope is told an edit
+        corrupted a timeline when no edit happened.
+
+        Identity is checked rather than the action being allow-listed, because
+        the set of actions that can swap the current timeline is open-ended
+        (`load`, `create`, `set_current`, anything that closes a project) while
+        the question -- does the baseline still refer to the thing we measured?
+        -- is the same for all of them.
+        """
+        for key in cls._IDENTITY_KEYS:
+            before, after = pre_state.get(key), post_state.get(key)
+            if before is not None and after is not None and before != after:
+                return key
+        return None
 
     def after_tool_call(
         self, ctx: ToolCallContext, result: Any, duration_ms: int
@@ -453,6 +608,23 @@ class DriftDetectionHook(LifecycleHook):
             if not post_state:
                 return None
             ctx.post_state = post_state
+
+            moved = self._baseline_identity_changed(ctx.pre_state, post_state)
+            if moved:
+                # Say so explicitly rather than returning None. "No drift
+                # record" is indistinguishable from "not checked"; this reports
+                # that the check ran and the baseline stopped applying.
+                return {
+                    "drift_detected": False,
+                    "baseline_reset": True,
+                    "reset_on": moved,
+                    "notice": (
+                        f"Drift not evaluated: {moved} changed from "
+                        f"{ctx.pre_state.get(moved)!r} to {post_state.get(moved)!r} "
+                        f"during '{ctx.action}', so the pre-state duration is no "
+                        "longer a baseline for the post-state duration."
+                    ),
+                }
 
             pre_dur = ctx.pre_state.get("duration_frames")
             post_dur = post_state.get("duration_frames")
@@ -493,6 +665,45 @@ class ProvenanceTraceHook(LifecycleHook):
         }
 
 
+class OperationLogHook(LifecycleHook):
+    """Writes a compact append-only record for each mutating operation."""
+    name = "operation_log"
+
+    def after_tool_call(
+        self, ctx: ToolCallContext, result: Any, duration_ms: int
+    ) -> Optional[Dict[str, Any]]:
+        if not ctx.risk.destructive:
+            return None
+        record = operation_log.build_record(
+            tool_name=ctx.tool_name,
+            action=ctx.action,
+            params=ctx.params,
+            result=result,
+            risk=ctx.risk.to_dict(),
+        )
+        operation_log.write_record(record)
+        return {
+            "logged": operation_log.operation_log_enabled(),
+            "operation_id": record["operation_id"],
+            "path": operation_log.operation_log_path(),
+        }
+
+    def on_error(
+        self, ctx: ToolCallContext, exc: Exception, duration_ms: int
+    ) -> None:
+        if not ctx.risk.destructive:
+            return
+        record = operation_log.build_exception_record(
+            tool_name=ctx.tool_name,
+            action=ctx.action,
+            params=ctx.params,
+            exc=exc,
+            risk=ctx.risk.to_dict(),
+            duration_ms=duration_ms,
+        )
+        operation_log.write_record(record)
+
+
 # ─── Pipeline Coordinator ───────────────────────────────────────────────────
 
 
@@ -528,6 +739,7 @@ class LifecyclePipeline:
         self._hooks.append(ReadbackVerificationHook())
         self._hooks.append(DriftDetectionHook())
         self._hooks.append(ProvenanceTraceHook())
+        self._hooks.append(OperationLogHook())
 
     def register_hook(self, hook: LifecycleHook) -> None:
         with self._lock:
@@ -662,4 +874,3 @@ def classify_operation_risk(
     tool_name: str, action: str, params: Optional[Dict[str, Any]] = None
 ) -> RiskAssessment:
     return RiskClassificationHook.classify(tool_name, action, params or {})
-

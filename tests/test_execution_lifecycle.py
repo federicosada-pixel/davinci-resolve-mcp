@@ -204,7 +204,7 @@ class TestExecutionLifecycle(unittest.TestCase):
         self.assertEqual(res["risk"]["level"], "high")
 
     def test_classify_operation_risk_critical_project_delete(self):
-        assessment = classify_operation_risk("project_manager", "delete_project", {"project_name": "Old"})
+        assessment = classify_operation_risk("project_manager", "delete", {"project_name": "Old"})
         self.assertEqual(assessment.level, RiskLevel.CRITICAL)
         self.assertTrue(assessment.destructive)
         self.assertTrue(assessment.confirmation_required)
@@ -215,6 +215,111 @@ class TestExecutionLifecycle(unittest.TestCase):
         self.assertEqual(assessment.level, RiskLevel.HIGH)
         self.assertEqual(assessment.blast_radius, BlastRadius.TIMELINE)
         self.assertTrue(any("Ripple" in r for r in assessment.reasons))
+
+    def test_raw_graph_lut_mutations_are_high_risk_for_timeline_or_group(self):
+        cases = (
+            ("set_lut", {"node_index": 1, "lut_path": "look.cube"}, BlastRadius.TIMELINE),
+            ("apply_arri_cdl_lut", {}, BlastRadius.TIMELINE),
+            (
+                "set_lut",
+                {"node_index": 1, "lut_path": "look.cube", "source": "color_group_pre"},
+                BlastRadius.PROJECT,
+            ),
+            ("apply_arri_cdl_lut", {"source": "color_group_post"}, BlastRadius.PROJECT),
+        )
+        for action, params, radius in cases:
+            with self.subTest(action=action, source=params.get("source", "timeline")):
+                assessment = classify_operation_risk("graph", action, params)
+                self.assertEqual(assessment.level, RiskLevel.HIGH)
+                self.assertTrue(assessment.destructive)
+                self.assertTrue(assessment.confirmation_required)
+                self.assertEqual(assessment.blast_radius, radius)
+
+    def test_raw_graph_lut_mutations_stay_medium_for_item_source(self):
+        for action, params in (
+            ("set_lut", {"node_index": 1, "lut_path": "look.cube", "source": "item"}),
+            ("apply_arri_cdl_lut", {"source": "item"}),
+        ):
+            with self.subTest(action=action):
+                assessment = classify_operation_risk("graph", action, params)
+                self.assertEqual(assessment.level, RiskLevel.MEDIUM)
+                self.assertTrue(assessment.destructive)
+                self.assertFalse(assessment.confirmation_required)
+                self.assertEqual(assessment.blast_radius, BlastRadius.ITEM)
+
+    def test_every_graph_action_reports_the_radius_of_its_source(self):
+        """`source` picks the graph for EVERY graph mutation, so the radius is a
+        property of the call: reset_all_grades on a color-group graph wipes the
+        grade of every clip in the group, and must not read as one item."""
+        expected = {
+            None: BlastRadius.TIMELINE,
+            "timeline": BlastRadius.TIMELINE,
+            "item": BlastRadius.ITEM,
+            "color_group_pre": BlastRadius.PROJECT,
+            "color_group_post": BlastRadius.PROJECT,
+        }
+        levels = {
+            "reset_all_grades": RiskLevel.HIGH,
+            "apply_grade_from_drx": RiskLevel.HIGH,
+            "set_node_enabled": RiskLevel.LOW,
+        }
+        for action, level in levels.items():
+            for source, radius in expected.items():
+                params = {} if source is None else {"source": source}
+                with self.subTest(action=action, source=source):
+                    assessment = classify_operation_risk("graph", action, params)
+                    self.assertEqual(assessment.level, level)
+                    self.assertEqual(assessment.blast_radius, radius)
+                    self.assertTrue(assessment.recognised)
+                    self.assertTrue(any("Graph target" in r for r in assessment.reasons))
+
+    def test_reviewed_medium_band_actions_remain_established_medium(self):
+        """Medium is a reviewed rating, not the classifier's fallthrough."""
+        cases = (
+            ("media_pool", "append_to_timeline", {}, BlastRadius.TIMELINE),
+            ("media_pool", "auto_sync_audio", {}, BlastRadius.TIMELINE),
+            ("media_pool", "move_clips", {}, BlastRadius.TIMELINE),
+            ("media_pool", "move_folders", {}, BlastRadius.TIMELINE),
+            ("media_pool", "setup_multicam_timeline", {}, BlastRadius.TIMELINE),
+            ("timeline", "copy_clips", {}, BlastRadius.TIMELINE),
+            ("timeline", "copy_range", {}, BlastRadius.TIMELINE),
+            ("timeline", "duplicate_clips", {}, BlastRadius.TIMELINE),
+            ("timeline", "duplicate_range", {}, BlastRadius.TIMELINE),
+            ("timeline", "insert_fusion_composition", {}, BlastRadius.TIMELINE),
+            ("timeline", "insert_fusion_generator", {}, BlastRadius.TIMELINE),
+            ("timeline", "insert_fusion_title", {}, BlastRadius.TIMELINE),
+            ("timeline", "insert_generator", {}, BlastRadius.TIMELINE),
+            ("timeline", "insert_ofx_generator", {}, BlastRadius.TIMELINE),
+            ("timeline", "insert_title", {}, BlastRadius.TIMELINE),
+            ("timeline", "set_setting", {}, BlastRadius.TIMELINE),
+            ("timeline", "set_start_timecode", {}, BlastRadius.TIMELINE),
+            ("timeline", "set_voice_isolation_state", {}, BlastRadius.TIMELINE),
+            ("timeline_ai", "analyze_dolby_vision", {}, BlastRadius.TIMELINE),
+            ("timeline_ai", "create_subtitles", {}, BlastRadius.TIMELINE),
+            ("timeline_item", "set_property", {}, BlastRadius.ITEM),
+            ("timeline_item", "set_retime", {}, BlastRadius.ITEM),
+            ("timeline_item", "set_voice_isolation_state", {}, BlastRadius.ITEM),
+            ("timeline_item_color", "add_version", {}, BlastRadius.ITEM),
+            ("timeline_item_color", "assign_color_group", {}, BlastRadius.ITEM),
+            ("timeline_item_color", "create_magic_mask", {}, BlastRadius.ITEM),
+            ("timeline_item_color", "load_version", {}, BlastRadius.ITEM),
+            ("timeline_item_color", "regenerate_magic_mask", {}, BlastRadius.ITEM),
+            ("timeline_item_color", "set_cdl", {}, BlastRadius.ITEM),
+            ("timeline_item_color", "smart_reframe", {}, BlastRadius.ITEM),
+            ("timeline_item_color", "stabilize", {}, BlastRadius.ITEM),
+            ("timeline_item_fusion", "import_comp", {}, BlastRadius.ITEM),
+            ("timeline_item_fusion", "load_comp", {}, BlastRadius.ITEM),
+            ("graph", "set_lut", {"source": "item"}, BlastRadius.ITEM),
+            ("graph", "apply_arri_cdl_lut", {"source": "item"}, BlastRadius.ITEM),
+        )
+        for tool, action, params, radius in cases:
+            with self.subTest(action=f"{tool}.{action}", params=params):
+                assessment = classify_operation_risk(tool, action, params)
+                self.assertEqual(assessment.level, RiskLevel.MEDIUM)
+                self.assertTrue(assessment.destructive)
+                self.assertTrue(assessment.recognised)
+                self.assertFalse(assessment.confirmation_required)
+                self.assertEqual(assessment.blast_radius, radius)
 
     def test_readback_verification_hook_handles_contradiction(self):
         hook = ReadbackVerificationHook()
@@ -251,6 +356,72 @@ class TestExecutionLifecycle(unittest.TestCase):
         drift = res["_operation"]["lifecycle"]["drift_detection"]
         self.assertTrue(drift["drift_detected"])
         self.assertEqual(drift["duration_delta_frames"], -40)
+
+    def test_drift_detection_skips_a_project_switch(self):
+        """Issue #224: `project_manager.load` swaps the current project, so the
+        pre- and post-state durations describe two different timelines. The
+        difference between them is not drift and must not be reported as such."""
+        states = [
+            {"project_name": "A", "timeline_name": "Cut A", "duration_frames": 120},
+            {"project_name": "B", "timeline_name": "Cut B", "duration_frames": 17854},
+        ]
+        provider = lambda: states.pop(0) if states else None
+        hook = DriftDetectionHook(state_provider=provider)
+        ctx = ToolCallContext("project_manager", "load", {"name": "B"})
+        ctx.pre_state = hook._state_provider()
+
+        envelope = {"success": True, "_operation": {"op": "project_manager.load"}}
+        self.pipeline.register_hook(hook)
+        res = self.pipeline.run_after(ctx, envelope, duration_ms=25)
+        drift = res["_operation"]["lifecycle"]["drift_detection"]
+        self.assertFalse(drift["drift_detected"])
+        self.assertTrue(drift["baseline_reset"])
+        self.assertEqual(drift["reset_on"], "project_name")
+        self.assertNotIn("duration_delta_frames", drift)
+
+    def test_drift_detection_skips_a_timeline_switch_inside_one_project(self):
+        """Same rule one level down: the current timeline can be replaced
+        without the project changing."""
+        states = [
+            {"project_name": "A", "timeline_name": "Cut v1", "duration_frames": 120},
+            {"project_name": "A", "timeline_name": "Cut v2", "duration_frames": 900},
+        ]
+        provider = lambda: states.pop(0) if states else None
+        hook = DriftDetectionHook(state_provider=provider)
+        ctx = ToolCallContext("timeline", "set_current", {"name": "Cut v2"})
+        ctx.pre_state = hook._state_provider()
+        res = hook.after_tool_call(ctx, {"success": True}, duration_ms=5)
+        self.assertFalse(res["drift_detected"])
+        self.assertEqual(res["reset_on"], "timeline_name")
+
+    def test_drift_detection_still_fires_on_the_same_timeline(self):
+        """The fix must not silence the case the hook exists for: same project,
+        same timeline, duration moved under a non-duration-altering action."""
+        states = [
+            {"project_name": "A", "timeline_name": "Cut A", "duration_frames": 240},
+            {"project_name": "A", "timeline_name": "Cut A", "duration_frames": 200},
+        ]
+        provider = lambda: states.pop(0) if states else None
+        hook = DriftDetectionHook(state_provider=provider)
+        ctx = ToolCallContext("timeline", "set_clip_color", {})
+        ctx.pre_state = hook._state_provider()
+        res = hook.after_tool_call(ctx, {"success": True}, duration_ms=5)
+        self.assertTrue(res["drift_detected"])
+        self.assertEqual(res["duration_delta_frames"], -40)
+
+    def test_drift_detection_tolerates_states_without_identity(self):
+        """A state provider that reports no timeline name (older payloads, or a
+        project with no current timeline) must not silently disable the check."""
+        states = [
+            {"duration_frames": 240},
+            {"duration_frames": 200},
+        ]
+        provider = lambda: states.pop(0) if states else None
+        hook = DriftDetectionHook(state_provider=provider)
+        ctx = ToolCallContext("timeline", "set_clip_color", {})
+        ctx.pre_state = hook._state_provider()
+        res = hook.after_tool_call(ctx, {"success": True}, duration_ms=5)
+        self.assertTrue(res["drift_detected"])
 
     def test_bridge_connection_and_live_lifecycle_state(self):
         import tempfile

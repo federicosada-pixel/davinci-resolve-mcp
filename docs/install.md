@@ -53,7 +53,7 @@ Model weights carry their own licences, separate from the code that loads them.
 > (`brew install python@3.12`, `pyenv install 3.12`, or python.org on Windows) and
 > point the launcher at it with `DAVINCI_RESOLVE_MCP_PYTHON=/path/to/python3.12`.
 
-Validated live coverage is based on **DaVinci Resolve 19.1.3 Studio** for the original API surface, plus **DaVinci Resolve 20.3.2 Studio** for the Resolve 20.0-20.2.2 scripting additions. Resolve 21 beta APIs are intentionally deferred until a stable release.
+Validated live coverage is based on **DaVinci Resolve 19.1.3 Studio** for the original API surface, **DaVinci Resolve 20.3.2 Studio** for the Resolve 20 additions, and **DaVinci Resolve 21.0.2.4 Studio** for the Resolve 21 additions. Resolve 21 capabilities are runtime-gated, so older builds keep those actions unavailable rather than failing server startup. `AnalyzeForIntellisearch`, `AnalyzeForSlate`, and `GenerateSpeech` additionally require Resolve's separately downloaded AI Extras pack.
 
 ## Quick Start
 
@@ -127,6 +127,8 @@ npx davinci-resolve-mcp setup --clients all   # Configure all clients
 npx davinci-resolve-mcp doctor                # Dry-run environment/config check
 npx davinci-resolve-mcp server                # Launch the managed MCP server
 npx davinci-resolve-mcp control-panel         # Launch the local control panel
+npx davinci-resolve-mcp batch plan /path/to/footage
+npx davinci-resolve-mcp batch run /path/to/footage --json
 npx davinci-resolve-mcp sync                  # Refresh the managed install only
 
 python install.py                              # Interactive mode
@@ -143,8 +145,8 @@ The MCP server comes in two modes:
 
 | Mode | File | Tools | Best For |
 |------|------|-------|----------|
-| **Compound** (default) | `src/server.py` | 36 | Most users — fast, clean, low context usage |
-| **Full** | `src/resolve_mcp_server.py` | 353 | Power users who want one tool per API method |
+| **Compound** (default) | `src/server.py` | 37 | Most users — fast, clean, low context usage |
+| **Full** | `src/resolve_mcp_server.py` | 389 | Power users who want one tool per API method |
 
 The compound server's `timeline_item` tool includes dedicated actions for common workflows:
 
@@ -159,7 +161,7 @@ The compound server's `timeline_item` tool includes dedicated actions for common
 
 The installer uses the compound server by default. To use the full server:
 ```bash
-python src/server.py --full    # Launch full 353-tool server
+python src/server.py --full    # Launch full 389-tool server
 # Or point your MCP config directly at src/resolve_mcp_server.py
 ```
 
@@ -236,6 +238,18 @@ environment.
 Network scripting permits remote control of Resolve. Prefer Local mode when
 remote access is unnecessary; otherwise restrict access with host firewall and
 network controls.
+
+The MCP server's own networked transport (`--transport streamable-http` or
+`sse`) binds `127.0.0.1:8000` by default and requires `Authorization: Bearer
+<token>` on every request (`DAVINCI_MCP_TOKEN`, or a generated one). To serve a
+client on another machine, set `DAVINCI_MCP_HOST` to the address to bind and,
+if clients reach the box by a DNS name rather than that address, list the names
+in `DAVINCI_MCP_ALLOWED_HOSTS` (comma-separated). The transport keeps
+DNS-rebinding protection on, pinned to the bind host, loopback, and those
+names; a request whose `Host` header is none of them gets 421. A wildcard bind
+(`0.0.0.0` / `::`) with no names listed turns the Host check off, since a
+client never sends the wildcard as its Host, and the bearer token is then the
+only gate. Restrict a non-loopback bind with a host firewall.
 
 Run the read-only doctor against Network mode explicitly:
 
