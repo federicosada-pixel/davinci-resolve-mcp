@@ -53,6 +53,7 @@
     "CLAUDE.md"
   ],
   "scripts": {
+    "files:analyze": "python3 tools/file-analyzer/analyze.py",
     "smoke": "node bin/davinci-resolve-mcp.mjs --help && node bin/davinci-resolve-mcp.mjs --version",
     "pack:check": "npm pack --dry-run"
   },
