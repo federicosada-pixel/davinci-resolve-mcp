@@ -3,7 +3,7 @@
 # Used by the 12-hourly launchd job and safe to run by hand.
 #   bash run_recovery.sh            # full: index + scan every set
 #   bash run_recovery.sh --user-only
-set -u
+set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p data
 LOG=data/run.log

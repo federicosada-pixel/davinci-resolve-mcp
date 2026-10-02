@@ -925,11 +925,15 @@ class ManifestResult:
 def load_manifest(root: str, manifest_path: Optional[str]) -> Optional[Tuple[str, Dict[str, dict]]]:
     cand = manifest_path or os.path.join(root, "manifest.json")
     if not os.path.isfile(cand):
+        if manifest_path:
+            raise FileNotFoundError(f"manifest not found: {cand}")
         return None
     try:
         with open(cand, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
+        if manifest_path:
+            raise
         return None
     entries: Dict[str, dict] = {}
     items = data.get("files", data) if isinstance(data, dict) else data
@@ -956,7 +960,8 @@ def verify_manifest(root: str, manifest: Tuple[str, Dict[str, dict]], files_by_p
             continue
         rec = files_by_path.get(abs_path)
         try:
-            size = os.stat(abs_path).st_size
+            st = os.stat(abs_path)
+            size = st.st_size
         except OSError:
             res.missing.append(rel)
             continue
@@ -966,7 +971,8 @@ def verify_manifest(root: str, manifest: Tuple[str, Dict[str, dict]], files_by_p
             continue
         exp_hash = (meta.get("sha256") or "").lower()
         if exp_hash:
-            if rec is not None and rec.dataless:
+            dataless = bool(getattr(st, "st_flags", 0) & SF_DATALESS) or bool(rec and rec.dataless)
+            if dataless:
                 res.invalid.append(f"{rel} (not downloaded; cannot hash)")
                 continue
             try:
@@ -1503,7 +1509,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     groups, unverified = find_duplicates(scanner.files, scanner.stats, args.quiet)
 
     manifest_res = None
-    manifest = load_manifest(root, args.manifest)
+    try:
+        manifest = load_manifest(root, args.manifest)
+    except (OSError, ValueError) as exc:
+        print(f"error: could not load manifest: {exc}", file=sys.stderr)
+        return 2
     if manifest:
         by_path = {r.path: r for r in scanner.files}
         manifest_res = verify_manifest(root, manifest, by_path)

@@ -37,13 +37,14 @@ PRESET_EXT = {".fxp", ".fxb", ".vstpreset", ".aupreset", ".nksf", ".nki", ".nkm"
 PLUGIN_BUNDLE_EXT = {".vst", ".vst3", ".component", ".clap", ".aaxplugin"}
 INSTALLER_EXT = {".pkg", ".dmg", ".zip", ".rar", ".7z"}
 MAXPATCH_EXT = {".maxpat", ".maxhelp", ".amxd"}
+SF_DATALESS = 0x40000000
 
 ALL_FILE_EXT = AUDIO_EXT | LIVE_EXT | MIDI_EXT | PRESET_EXT | INSTALLER_EXT | MAXPATCH_EXT
 
 SKIP_DIR_NAMES = {
     "node_modules", ".git", ".svn", "__pycache__", ".Trash", ".Trashes",
     ".Spotlight-V100", ".fseventsd", ".TemporaryItems", ".DocumentRevisions-V100",
-    "System Volume Information", "Caches", "com.apple.bird", "CloudStorage",
+    "System Volume Information", "Caches", "com.apple.bird",
     "Xcode", "DerivedData", "Containers", "Group Containers", "Mail",
     "Messages", "Photos Library.photoslibrary", "Photo Booth Library",
     "Safari", "Google", "Mobile Documents",
@@ -56,6 +57,7 @@ DEFAULT_ROOTS = [
     HOME / "Downloads",
     HOME / "Movies",
     HOME / "Dropbox",
+    HOME / "Library" / "CloudStorage",
     HOME / "Library" / "Audio",
     HOME / "Library" / "Application Support",
     Path("/Users/Shared"),
@@ -151,6 +153,8 @@ def walk(root: Path, rows, seen_dirs, stats):
                     try:
                         st = entry.stat(follow_symlinks=False)
                     except OSError:
+                        continue
+                    if getattr(st, "st_flags", 0) & SF_DATALESS:
                         continue
                     rows.append((name.lower(), name, ext, classify(ext), entry.path,
                                  st.st_size, int(st.st_mtime), volume_of(entry.path),

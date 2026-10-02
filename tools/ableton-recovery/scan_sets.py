@@ -207,30 +207,27 @@ class Index:
 
 
 def rank(cands, ref):
-    """Score exact-name hits. Higher is better."""
+    """Rank exact-name hits by lexicographic recovery priority."""
     orig = ref["path"] or ref["relative_path"]
     orig_parts = [x.lower() for x in orig.split("/") if x][:-1]
     orig_vol = orig.split("/")[2] if orig.startswith("/Volumes/") else "Macintosh HD"
     scored = []
     for path, size, volume, in_backup in cands:
-        s = 0
-        if ref["orig_size"] and size == ref["orig_size"]:
-            s += 100
+        size_match = bool(ref["orig_size"] and size == ref["orig_size"])
         parts = [x.lower() for x in path.split("/") if x][:-1]
         n = 0
         while n < min(len(parts), len(orig_parts)) and parts[-1 - n] == orig_parts[-1 - n]:
             n += 1
-        s += 10 * n
-        if volume == orig_vol:
-            s += 5
-        if not in_backup:
-            s += 3
-        if "/Music/Ableton/" in path:
-            s += 2
-        if ".alp/" in path or "/.Trash" in path:
-            s -= 50
-        scored.append((s, path, size))
-    scored.sort(key=lambda x: (-x[0], x[1]))
+        priority = (
+            int(size_match),
+            n,
+            int(volume == orig_vol),
+            int(not in_backup),
+            int("/Music/Ableton/" in path),
+            int(".alp/" not in path and "/.Trash" not in path),
+        )
+        scored.append((priority, path, size))
+    scored.sort(key=lambda x: (tuple(-part for part in x[0]), x[1]))
     return scored
 
 
@@ -311,7 +308,7 @@ def scan(sets, index: Index, verbose=False):
                 "orig_size": ref["orig_size"],
                 "status": "found_elsewhere" if hits else "permanently_missing",
                 "best_match": hits[0][1] if hits else None,
-                "best_score": hits[0][0] if hits else None,
+                "best_score": list(hits[0][0]) if hits else None,
                 "size_match": bool(hits and ref["orig_size"] and hits[0][2] == ref["orig_size"]),
                 "alternates": [h[1] for h in hits[1:4]],
                 "hit_count": len(hits),
@@ -392,7 +389,8 @@ def write_outputs(results, index, out_dir: Path, scope):
             flag = "" if m["size_match"] or not m["orig_size"] else "   # size differs from original, verify"
             block.append(f'restore {sh(m["best_match"])} {sh(m["target"])}{flag}')
         if block:
-            lines.append(f'# === {r["set"]}')
+            set_comment = r["set"].replace("\r", " ").replace("\n", " ")
+            lines.append(f"# === {set_comment}")
             lines += block + [""]
     lines += ['echo "targets: $n  copied: $done_  skipped(existing/gone): $skipped"',
               '[ "$APPLY" = 1 ] || echo "dry run only. Re-run with --apply to copy."']
