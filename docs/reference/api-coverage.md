@@ -25,7 +25,7 @@ Every non-deprecated method in the bundled legacy README is represented. This
 does not claim complete coverage of the newer Resolve 21.1 typed API. The
 default compound server exposes **37 tools** that group related operations by
 action parameter, keeping LLM context windows lean. The full granular server
-provides **387 individual tools** for power users. The legacy coverage spans
+provides **389 individual tools** for power users. The legacy coverage spans
 13 API object classes. MCP-level kernel actions are tracked separately in
 [Kernel Action Coverage](../kernels/README.md).
 
@@ -43,6 +43,10 @@ The typed stub shipped in #205 is now queryable from the server itself, the
 way Blackmagic's MCP exposes `search_scripting_api` — and each result also says
 whether this server wraps the method, so a lookup doubles as a parity check.
 See [Querying the typed API](typed-api-search.md).
+
+The 21.1 full-transcription and native timeline-item type readers are also
+available through both interfaces. A synthetic spoken clip matched the native
+results exactly; see [Resolve 21.1 transcription and type reads](resolve211-transcription-type.md).
 
 The 34th compound tool is `timeline_versioning` (C6) — an MCP-level workflow
 tool, not a wrapper around a Resolve API method. It surfaces the
@@ -251,7 +255,7 @@ Every method in the DaVinci Resolve Scripting API and its test status. Methods a
 
 | # | Method | Status | Test Result / Notes |
 |---|--------|--------|---------------------|
-| 1 | `ArchiveProject(projectName, filePath, ...)` | ⚠️ | API accepts; archiving is slow |
+| 1 | `ArchiveProject(projectName, filePath, ...)` | ⚠️ | Never produces an archive by script: returns `False` and writes nothing with source media and proxies off; either on crashes Resolve 21.1.0.14. Wrappers default every flag off and refuse the crashing two unless `acknowledge_trap`. See [project archive](project-archive.md). |
 | 2 | `CreateProject(projectName, mediaLocationPath)` | ✅ | Creates new project; optional media location added in Resolve 20.2.2 |
 | 3 | `DeleteProject(projectName)` | ⚠️ | Returns `False` if project is open |
 | 4 | `LoadProject(projectName)` | ✅ | Returns Project object |

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from src.utils import operation_log
+from src.utils.bool_params import coerce_bool
 
 logger = logging.getLogger("resolve-mcp.execution-lifecycle")
 
@@ -202,6 +203,9 @@ class RiskClassificationHook(LifecycleHook):
     #: them unrecognised, i.e. it warns that the risk is unestablished for the
     #: actions whose risk is the best established of any we dispatch.
     _LOW_RISK_ACTIONS: Set[Tuple[str, str]] = {
+        # Attaching a modifier to one Fusion input: one undo step, and
+        # disconnect(tool, input) removes it. (#250)
+        ("fusion_comp", "add_modifier"),
         ("dctl", "encrypt_native"),  # Creates a new file; never replaces existing content.
         ("timeline_markers", "add"),
         ("timeline_markers", "update_custom_data"),
@@ -270,6 +274,12 @@ class RiskClassificationHook(LifecycleHook):
         # `attenuate` refuses an existing destination but writes the same tree.
         ("lut", "install"),
         ("lut", "attenuate"),
+        # Project archive. Writes only a new path (an existing file or folder
+        # at the target was never touched in any measured case), but the two
+        # media flags crash Resolve 21.1.0.14 and lose unsaved work; the
+        # wrappers refuse those unless acknowledge_trap. See archive_guard.py.
+        ("project_manager", "archive"),
+        ("project_manager", "safe_project_archive"),
         # 21.0 AI deblur renders NEW media and never touches the source (it is
         # confirm-token gated for that reason). The `remove_` prefix rule rated
         # it HIGH on its name alone, which would make safe mode block a create.
@@ -371,6 +381,14 @@ class RiskClassificationHook(LifecycleHook):
         return BlastRadius.TIMELINE, "the timeline node graph (every clip on the timeline)"
 
     _READ_ONLY_PREFIXES = ("get_", "list_", "query_", "probe_", "inspect_", "export_", "check_")
+    #: Reads whose action name carries no read verb. Without an entry here a
+    #: pure read falls to the name-based MEDIUM default and every call reports
+    #: "risk unestablished" — noise on the one call an agent makes before
+    #: planning (project_manager.snapshot, #251).
+    _READ_ONLY_PAIRS = frozenset({
+        ("dctl", "validate_native"),
+        ("project_manager", "snapshot"),
+    })
 
     @classmethod
     def classify(cls, tool_name: str, action: str, params: Dict[str, Any]) -> RiskAssessment:
@@ -401,7 +419,7 @@ class RiskClassificationHook(LifecycleHook):
         ):
             level = RiskLevel.HIGH
             destructive = True
-            if params.get("ripple", False):
+            if coerce_bool(params.get("ripple")):
                 radius = BlastRadius.TIMELINE
                 reasons.append("Ripple mode alters downstream timeline synchronization")
             elif tool_name == "graph":
@@ -441,7 +459,7 @@ class RiskClassificationHook(LifecycleHook):
                 else BlastRadius.ITEM
             )
             reasons.append(f"Recoverable edit to existing state: {action}")
-        elif any(action.startswith(p) for p in cls._READ_ONLY_PREFIXES) or action in {"read", "status", "info"} or pair == ("dctl", "validate_native"):
+        elif any(action.startswith(p) for p in cls._READ_ONLY_PREFIXES) or action in {"read", "status", "info"} or pair in cls._READ_ONLY_PAIRS:
             level = RiskLevel.LOW
             destructive = False
             radius = BlastRadius.ITEM

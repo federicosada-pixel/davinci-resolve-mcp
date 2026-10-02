@@ -2,17 +2,17 @@
 
 [English](README.md) | 简体中文
 
-[![Version](https://img.shields.io/badge/version-4.1.3-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
+[![Version](https://img.shields.io/badge/version-4.8.20-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
 [![npm](https://img.shields.io/npm/v/davinci-resolve-mcp.svg?label=npm&color=CB3837)](https://www.npmjs.com/package/davinci-resolve-mcp)
 [![API Coverage](https://img.shields.io/badge/API%20Coverage-100%25-brightgreen.svg)](docs/reference/api-coverage.md)
-[![Tools](https://img.shields.io/badge/MCP%20Tools-37%20(387%20full)-blue.svg)](#服务器模式)
+[![Tools](https://img.shields.io/badge/MCP%20Tools-37%20(389%20full)-blue.svg)](#服务器模式)
 [![Advanced](https://img.shields.io/badge/Advanced%20(offline)-18%20tools-blueviolet.svg)](#服务器模式)
 [![Tested](https://img.shields.io/badge/Live%20Tested-93.6%25-green.svg)](docs/reference/api-coverage.md#test-results)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-18.5+-darkred.svg)](https://www.blackmagicdesign.com/products/davinciresolve)
 [![Python](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-> 本翻译对应 v4.1.3 版 README。如与英文原版有出入，以 [英文原版](README.md) 为准。
+> 本翻译对应 v4.8.20 版 README。如与英文原版有出入，以 [英文原版](README.md) 为准。
 
 一个 Model Context Protocol (MCP) 服务器，让 AI 助手通过官方脚本 API 控制 DaVinci Resolve Studio（达芬奇）。它提供完整的 API 覆盖，外加带护栏的工作流助手，涵盖剪辑、媒体池整理、渲染设置、审阅标记、调色、Fusion、Fairlight、项目生命周期任务、扩展开发，以及不碰源媒体的媒体分析。
 
@@ -88,7 +88,7 @@ venv/bin/python -m src.control_panel
 | 模式 | 入口 | 工具数 | 适合谁 |
 |------|------|--------|--------|
 | Compound（复合） | `src/server.py` | 37 | 大多数助手的默认模式。相关的 Resolve 操作按 action 参数分组，压低上下文占用。 |
-| Full / granular（细粒度） | `src/server.py --full` 或 `src/resolve_mcp_server.py` | 387 | 想要"一个 Resolve API 方法 = 一个 MCP 工具"的重度用户。 |
+| Full / granular（细粒度） | `src/server.py --full` 或 `src/resolve_mcp_server.py` | 389 | 想要"一个 Resolve API 方法 = 一个 MCP 工具"的重度用户。 |
 
 除非你明确需要一方法一工具的细粒度界面，否则推荐复合模式。
 
@@ -220,13 +220,13 @@ DRX 调色写入**针对 Resolve Studio 做过实机校准**：调色参数默�
 
 ## 安全态势
 
-默认服务器是由你的 MCP 客户端启动的本地 stdio 进程；它不暴露网络监听器，也没有内置多用户认证面。两个可选的本地 HTTP 面——控制面板与联网 MCP 传输——仅绑定回环地址，每个请求都需要每次启动生成的 bearer 令牌，并校验 Host/Origin 以防 DNS 重绑定和 CSRF。工具元数据包含面向 MCP 客户端的安全提示（只读、破坏性、幂等、外部资源操作）。操作边界、确认指引和漏洞报告见 [安全策略](SECURITY.md)。
+默认服务器是由你的 MCP 客户端启动的本地 stdio 进程；它不暴露网络监听器，也没有内置多用户认证面。两个可选的本地 HTTP 面——控制面板与联网 MCP 传输——仅绑定回环地址，每个请求都需要每次启动生成的 bearer 令牌，并校验 Host/Origin 以防 DNS 重绑定和 CSRF。工具元数据包含面向 MCP 客户端的安全提示（只读、破坏性、幂等、外部资源操作）。两个服务器上的破坏性写入都遵守 `destructive.safe_mode` 并写入安全审计日志；只有复合服务器会在修改前归档时间线——细粒度写入只会被拒绝或被记录，绝不会被恢复。操作边界、确认指引和漏洞报告见 [安全策略](SECURITY.md)。
 
 ## 关键数据
 
 | 指标 | 数值 |
 |------|------|
-| MCP 工具 | **37** 复合 / **387** 细粒度（实时服务器） |
+| MCP 工具 | **37** 复合 / **389** 细粒度（实时服务器） |
 | Advanced（离线）工具 | **18**——.drp/.drt/.drx + 数据库创作，无需 Resolve 运行 |
 | 内核 action | 9 个复合工具下 **136** 个带护栏的工作流 action |
 | API 方法覆盖 | **361/361**（100%） |

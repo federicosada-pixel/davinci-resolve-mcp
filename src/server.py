@@ -12,7 +12,7 @@ Usage:
     python src/server.py --full       # Start the granular server instead
 """
 
-VERSION = "4.1.3"
+VERSION = "4.8.20"
 
 import base64
 import os
@@ -53,6 +53,7 @@ from src.utils.resolve211_edits import validate_edit_options, validate_transitio
 
 # Platform-specific Resolve paths
 from src.utils.cdl import normalize_cdl_payload
+from src.utils import archive_guard
 from src.utils import typed_api_search
 from src.utils import lut_files
 from src.utils import resolve_writes as _resolve_writes
@@ -73,7 +74,11 @@ from src.utils.proc import safe_run
 from src.utils.readback import verify_by_readback, verification_stats as _verification_stats
 from src.utils import operation_result as _operation_result
 from src.utils import operation_log as _operation_log
-from src.utils.bool_params import explicit_bool_param as _explicit_bool_param
+from src.utils.bool_params import coerce_bool as _coerce_bool, explicit_bool_param as _explicit_bool_param
+from src.utils.confirm_tokens import (
+    ConfirmTokenStore as _ConfirmTokenStore,
+    gate_required_from as _gate_required_from,
+)
 from src.utils.operation_result import (
     build_operation_envelope as _build_operation_envelope,
     get_envelope_mode as _get_envelope_mode,
@@ -259,6 +264,8 @@ mcp = FastMCP(
         "issue link for the user to review and submit; nothing is filed for them."
     ),
 )
+if hasattr(mcp, "_mcp_server"):
+    mcp._mcp_server.version = VERSION
 
 READ_ONLY_TOOL = mcp_types.ToolAnnotations(
     readOnlyHint=True,
@@ -1270,7 +1277,7 @@ def _ai_governance_gate(op: str, p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     if _ai_governance_mode() != "enforce":
         return None
-    if p.get("override_governance") or p.get("overrideGovernance"):
+    if _coerce_bool(p.get("override_governance")) or _coerce_bool(p.get("overrideGovernance")):
         return None
     check = _ai_governance_check(op)
     if not check.get("applies") or not check.get("exceeded"):
@@ -1361,7 +1368,7 @@ def _action_will_gate_pending_confirm(
         tool_name == "timeline"
         and action == "delete_clips"
         and isinstance(params, dict)
-        and bool(params.get("ripple"))
+        and _coerce_bool(params.get("ripple"))
     ):
         return True
     return False
@@ -1784,7 +1791,7 @@ def _run_maybe_background(label: str, params: Dict[str, Any], fn):
     job and return its id at once; otherwise run fn inside long_resolve_op and
     return its result, preserving the synchronous contract.
     """
-    if params.get("background") or params.get("async_job"):
+    if _coerce_bool(params.get("background")) or _coerce_bool(params.get("async_job")):
         job_id = background_jobs.start_job(label, fn)
         return {
             "success": True,
@@ -1839,78 +1846,47 @@ import time as _time
 import uuid as _uuid
 
 
-_CONFIRM_TOKENS: Dict[str, Dict[str, Any]] = {}
-# The control panel runs on a threaded HTTP server, so issue/consume/gc of the
-# token table run on concurrent threads. Guard every access so a GC iteration
-# can't race a write and validate-then-pop stays atomic (EX4).
-_CONFIRM_TOKENS_LOCK = threading.RLock()
-_CONFIRM_TTL_SECONDS = 300
-
-
-def _confirm_token_fingerprint(action: str, params: Optional[Dict[str, Any]]) -> str:
-    """Stable hash of (action, params) that identifies one specific mutation request."""
-    payload = {"action": action, "params": params or {}}
-    # Strip the confirm_token itself if the caller is echoing it back to us.
-    if isinstance(payload["params"], dict) and "confirm_token" in payload["params"]:
-        payload["params"] = {k: v for k, v in payload["params"].items() if k != "confirm_token"}
-    try:
-        blob = json.dumps(payload, sort_keys=True, default=str)
-    except Exception:
-        blob = repr(payload)
-    return _hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
-
-
-def _confirm_token_gc():
-    """Drop expired tokens; called on every issue/validate. Caller may already
-    hold _CONFIRM_TOKENS_LOCK (RLock makes re-entry safe)."""
-    now = _time.time()
-    with _CONFIRM_TOKENS_LOCK:
-        expired = [t for t, rec in _CONFIRM_TOKENS.items() if rec.get("expires_at", 0) < now]
-        for t in expired:
-            _CONFIRM_TOKENS.pop(t, None)
-
-
 def _confirm_token_required() -> bool:
     """Honor setup default destructive.require_confirm_token (default True)."""
     try:
         prefs = _read_media_analysis_preferences() if "_read_media_analysis_preferences" in globals() else {}
     except Exception:
         prefs = {}
-    destructive = prefs.get("destructive") if isinstance(prefs.get("destructive"), dict) else {}
-    val = destructive.get("require_confirm_token", True)
-    if isinstance(val, str):
-        return val.strip().lower() not in {"0", "false", "no", "off"}
-    return bool(val)
+    return _gate_required_from(prefs)
+
+
+#: The token machinery itself lives in src/utils/confirm_tokens.py so the granular
+#: server can run the same gate in its own process — both surfaces reach
+#: TimelineItem.CopyGrades, and a second hand-rolled copy would drift. The names
+#: below stay module-level because callers and tests reach for them directly.
+#:
+#: `required` is a lambda, not `_confirm_token_required` itself, so the global is
+#: resolved on every call: tests patch `_confirm_token_required` on this module, and
+#: binding the function object here would capture the original and make that patch
+#: invisible to the store.
+_CONFIRM_TOKEN_STORE = _ConfirmTokenStore(
+    err=_err,
+    required=lambda: _confirm_token_required(),
+    ttl_seconds=300,
+)
+_CONFIRM_TOKENS: Dict[str, Dict[str, Any]] = _CONFIRM_TOKEN_STORE.tokens
+_CONFIRM_TOKENS_LOCK = _CONFIRM_TOKEN_STORE.lock
+_CONFIRM_TTL_SECONDS = _CONFIRM_TOKEN_STORE.ttl_seconds
+
+
+def _confirm_token_fingerprint(action: str, params: Optional[Dict[str, Any]]) -> str:
+    """Stable hash of (action, params) that identifies one specific mutation request."""
+    return _CONFIRM_TOKEN_STORE.fingerprint(action, params)
+
+
+def _confirm_token_gc():
+    """Drop expired tokens; called on every issue/validate."""
+    _CONFIRM_TOKEN_STORE.gc()
 
 
 def _issue_confirm_token(*, action: str, params: Optional[Dict[str, Any]], preview: Dict[str, Any]) -> Dict[str, Any]:
     """Mint a token. Returns the pending_user_decision response shape."""
-    token = _uuid.uuid4().hex
-    fp = _confirm_token_fingerprint(action, params)
-    expires_at = _time.time() + _CONFIRM_TTL_SECONDS
-    with _CONFIRM_TOKENS_LOCK:
-        _confirm_token_gc()
-        _CONFIRM_TOKENS[token] = {
-            "action": action,
-            "fingerprint": fp,
-            "expires_at": expires_at,
-            "issued_at": _time.time(),
-        }
-    body = _err(
-        f"This action is destructive. Re-call with confirm_token to proceed.",
-        code="CONFIRMATION_REQUIRED",
-        category="pending_user_decision",
-        retryable=False,
-        remediation=f"Re-call {action} with params.confirm_token={token!r}; token expires in {_CONFIRM_TTL_SECONDS}s.",
-    )
-    body.update({
-        "status": "confirmation_required",
-        "confirm_token": token,
-        "preview": preview,
-        "expires_at_epoch": expires_at,
-        "ttl_seconds": _CONFIRM_TTL_SECONDS,
-    })
-    return body
+    return _CONFIRM_TOKEN_STORE.issue(action=action, params=params, preview=preview)
 
 
 def _consume_confirm_token(*, action: str, params: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1918,41 +1894,7 @@ def _consume_confirm_token(*, action: str, params: Optional[Dict[str, Any]]) -> 
     If missing/expired/mismatched, return a destructive_blocked error.
     If gating is disabled, return None (proceed).
     """
-    if not _confirm_token_required():
-        return None
-    token = (params or {}).get("confirm_token") or (params or {}).get("confirmToken")
-    if not token:
-        return None  # Caller is expected to call _issue_confirm_token in this case.
-    with _CONFIRM_TOKENS_LOCK:
-        _confirm_token_gc()
-        rec = _CONFIRM_TOKENS.pop(token, None)  # one-time use, atomic with gc
-    if rec is None:
-        return _err(
-            "confirm_token is invalid, expired, or was issued by a different "
-            "server instance (tokens are valid only on the instance that "
-            "issued them — e.g. a stdio-server token is not honored by the "
-            "networked server).",
-            code="CONFIRM_TOKEN_INVALID",
-            category="destructive_blocked",
-            retryable=False,
-            remediation=f"Re-call {action} without confirm_token on this instance to receive a fresh token.",
-        )
-    if rec.get("action") != action:
-        return _err(
-            f"confirm_token issued for {rec.get('action')!r}, not {action!r}",
-            code="CONFIRM_TOKEN_ACTION_MISMATCH",
-            category="destructive_blocked",
-            retryable=False,
-        )
-    if rec.get("fingerprint") != _confirm_token_fingerprint(action, params):
-        return _err(
-            "confirm_token does not match the current params",
-            code="CONFIRM_TOKEN_FINGERPRINT_MISMATCH",
-            category="destructive_blocked",
-            retryable=False,
-            remediation="Either re-issue the token with current params or roll back the params change.",
-        )
-    return None  # OK to proceed
+    return _CONFIRM_TOKEN_STORE.consume(action=action, params=params)
 
 
 def _activate_resolve_window() -> Dict[str, Any]:
@@ -2533,7 +2475,7 @@ def _annotation_target(scope: str, p: Dict[str, Any], tl=None):
                 return None, err
         return tl, None
     if scope == "timeline_item":
-        if p.get("current"):
+        if _coerce_bool(p.get("current")):
             if tl is None:
                 _, tl, err = _get_tl()
                 if err:
@@ -2614,7 +2556,7 @@ def _probe_annotations(tl, p: Dict[str, Any]):
 
 
 def _normalize_marker_payload_action(tl, p: Dict[str, Any]):
-    marker, err = _marker_add_payload(p, tl=tl, default_to_current=bool(p.get("default_to_current", False)))
+    marker, err = _marker_add_payload(p, tl=tl, default_to_current=_coerce_bool(p.get("default_to_current"), False))
     if err:
         return err
     return {"marker": marker}
@@ -2643,11 +2585,11 @@ def _copy_annotations(tl, p: Dict[str, Any], *, move: bool = False):
             copied += 1
         else:
             warnings.append({"frame": frame, "result": result})
-    if p.get("include_flags", True) and _has_method(source, "GetFlagList") and _has_method(target, "AddFlag"):
+    if _coerce_bool(p.get("include_flags"), True) and _has_method(source, "GetFlagList") and _has_method(target, "AddFlag"):
         for flag in source.GetFlagList() or []:
             if not target.AddFlag(flag):
                 warnings.append({"flag": flag, "result": "AddFlag returned false"})
-    if p.get("include_clip_color", True) and _has_method(source, "GetClipColor") and _has_method(target, "SetClipColor"):
+    if _coerce_bool(p.get("include_clip_color"), True) and _has_method(source, "GetClipColor") and _has_method(target, "SetClipColor"):
         color = source.GetClipColor()
         if color and not target.SetClipColor(color):
             warnings.append({"clip_color": color, "result": "SetClipColor returned false"})
@@ -2689,13 +2631,13 @@ def _clear_annotations_by_scope(tl, p: Dict[str, Any]):
         if not _has_method(target, "DeleteMarkerByCustomData"):
             return _err(f"{scope} does not expose DeleteMarkerByCustomData")
         return {"success": bool(target.DeleteMarkerByCustomData(_first_param(p, "custom_data", "customData", default="")))}
-    color = p.get("color", "All" if p.get("all", True) else "Blue")
+    color = p.get("color", "All" if _coerce_bool(p.get("all"), True) else "Blue")
     if not _has_method(target, "DeleteMarkersByColor"):
         return _err(f"{scope} does not expose DeleteMarkersByColor")
     result = {"success": bool(target.DeleteMarkersByColor(color)), "color": color}
-    if p.get("clear_flags") and _has_method(target, "ClearFlags"):
+    if _coerce_bool(p.get("clear_flags")) and _has_method(target, "ClearFlags"):
         result["flags_cleared"] = bool(target.ClearFlags(p.get("flag_color", "All")))
-    if p.get("clear_clip_color") and _has_method(target, "ClearClipColor"):
+    if _coerce_bool(p.get("clear_clip_color")) and _has_method(target, "ClearClipColor"):
         result["clip_color_cleared"] = bool(target.ClearClipColor())
     return result
 
@@ -2706,7 +2648,7 @@ def _export_review_report(tl, p: Dict[str, Any]):
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "annotations": _probe_annotations(tl, p),
     }
-    if p.get("include_capabilities", True):
+    if _coerce_bool(p.get("include_capabilities"), True):
         report["capabilities"] = _annotation_capabilities()
     return report
 
@@ -2971,6 +2913,45 @@ def _find_clip(folder, clip_id):
     return None
 
 
+def _clips_from_ids(root, clip_ids, *, verb):
+    """Resolve Media Pool clip unique IDs to clip objects. Returns (clips, error).
+
+    Unresolved ids abort the call instead of being dropped. The raw clip actions
+    used to filter misses out and hand Resolve whatever was left, so a mixed batch
+    deleted, moved, relinked or unlinked the subset that happened to resolve and
+    answered plain {"success": true} — indistinguishable from every id having
+    resolved. move_clips/relink/unlink did not even stop at an empty result:
+    MoveClips([], target) moved nothing and still reported success.
+
+    A non-list is refused rather than iterated: a bare string used to become one
+    id per character, each matching nothing and each silently dropped.
+    """
+    if not isinstance(clip_ids, list) or not clip_ids:
+        return None, _err(
+            "clip_ids must be a non-empty list of Media Pool clip unique IDs",
+            code="INVALID_CLIP_IDS", category="invalid_input",
+            remediation="Pass clip_ids as a list, e.g. params={\"clip_ids\": [\"<id>\"]}.")
+    clips, resolved, unresolved = [], [], []
+    for cid in clip_ids:
+        cid = str(cid)
+        found = _find_clip(root, cid)
+        if found is None:
+            unresolved.append(cid)
+        else:
+            clips.append(found)
+            resolved.append(cid)
+    if unresolved:
+        return None, _err(
+            f"Clip(s) not found: {', '.join(unresolved)}",
+            code="CLIP_NOT_FOUND", category="invalid_input",
+            reason=(f"{len(unresolved)} of {len(clip_ids)} clip_ids matched no clip "
+                    f"anywhere in the Media Pool; nothing was {verb}."),
+            remediation=("List clips with folder get_clips (or media_pool get_selected) "
+                         "and pass only ids that still exist."),
+            state={"unresolved_clip_ids": unresolved, "resolved_clip_ids": resolved})
+    return clips, None
+
+
 def _find_clip_with_parent(folder, clip_id, _parent=None):
     """Return (clip, parent_folder) for clip_id, searching recursively.
 
@@ -2987,6 +2968,13 @@ def _find_clip_with_parent(folder, clip_id, _parent=None):
             return found_clip, found_parent
     return None, None
 
+
+_FOLDER_ID_REMEDIATION = (
+    "List folders with folder get_subfolders (walking down from "
+    "path=\"Master\") and address by exact path or folder_id."
+)
+
+
 def _find_folder_by_id(folder, folder_id):
     if folder.GetUniqueId() == folder_id:
         return folder
@@ -2995,6 +2983,57 @@ def _find_folder_by_id(folder, folder_id):
         if found:
             return found
     return None
+
+
+def _folders_from_ids(root, folder_ids, *, verb):
+    """Resolve Media Pool folder unique IDs to folder objects. Returns (folders, error).
+
+    Searches the WHOLE tree. The ids callers hold come from GetUniqueId() /
+    folder.get_subfolders, which hand them out at every depth, so the shallow
+    scan of root's direct children this replaced answered "No folders found" for
+    any nested folder — verified live on Resolve Studio 21.1.0.14, where
+    deleting Master/OUTDOORS/1_FOOTAGE/<clip bin> by its own id failed while
+    mp.DeleteFolders() on the recursively resolved object worked.
+
+    Unresolved ids abort the call instead of being dropped. Skipping them let a
+    partial match delete or move the subset it did find and answer plain
+    {"success": true}, which is indistinguishable from every id having resolved.
+
+    The root (Master) folder is refused rather than passed to Resolve: it cannot
+    be deleted or moved, and the shallow search could never return it.
+    """
+    if not isinstance(folder_ids, list) or not folder_ids:
+        return None, _err(
+            "folder_ids must be a non-empty list of folder unique IDs",
+            code="INVALID_FOLDER_IDS", category="invalid_input",
+            remediation=_FOLDER_ID_REMEDIATION)
+    root_id = root.GetUniqueId()
+    folders, unresolved, named_root = [], [], False
+    for fid in folder_ids:
+        fid = str(fid)
+        if fid == root_id:
+            named_root = True
+            continue
+        found = _find_folder_by_id(root, fid)
+        if found is None:
+            unresolved.append(fid)
+        else:
+            folders.append(found)
+    if named_root:
+        return None, _err(
+            f"The root (Master) folder cannot be {verb}",
+            code="ROOT_FOLDER_NOT_ELIGIBLE", category="invalid_input",
+            state={"root_folder_id": root_id})
+    if unresolved:
+        return None, _err(
+            f"Folder(s) not found: {', '.join(unresolved)}",
+            code="FOLDER_NOT_FOUND", category="invalid_input",
+            reason=(f"{len(unresolved)} of {len(folder_ids)} folder_ids matched no folder "
+                    f"anywhere in the Media Pool; nothing was {verb}."),
+            remediation=_FOLDER_ID_REMEDIATION,
+            state={"unresolved_folder_ids": unresolved,
+                   "resolved_folder_ids": [f.GetUniqueId() for f in folders]})
+    return folders, None
 
 
 def _folder_from_params(mp, p, *path_keys, no_address="current"):
@@ -3017,8 +3056,7 @@ def _folder_from_params(mp, p, *path_keys, no_address="current"):
     `_navigate_folder(mp, "")`, which returns root). This fix must not also
     change what omitting the address means.
     """
-    remediation = ("List folders with folder get_subfolders (walking down from "
-                   "path=\"Master\") and address by exact path or folder_id.")
+    remediation = _FOLDER_ID_REMEDIATION
     path = _first_param(p, *path_keys)
     if path:
         f = _navigate_folder(mp, path)
@@ -4668,6 +4706,8 @@ def _normalize_include_linked(raw):
         lowered = raw.strip().lower()
         if lowered in {"all", "true", "yes"}:
             return {"video", "audio"}
+        if lowered in {"false", "no", "0", "off", "none"}:
+            return set()
         return {part.strip().lower() for part in lowered.split(",") if part.strip()}
     if isinstance(raw, list):
         return {str(part).strip().lower() for part in raw if str(part).strip()}
@@ -4820,7 +4860,7 @@ def _append_and_recover_timeline_item(
 
 def _timeline_duplicate_clips_impl(proj, tl, p: Dict[str, Any], *, delete_sources: bool = False, resolve=None):
     ids = p.get("clip_ids") or p.get("ids")
-    selected = bool(p.get("selected", False))
+    selected = _coerce_bool(p.get("selected"), False)
     if ids is not None and not isinstance(ids, list):
         return _err("duplicate_clips requires clip_ids (list of timeline item unique IDs)")
     if not ids and not selected:
@@ -4833,7 +4873,7 @@ def _timeline_duplicate_clips_impl(proj, tl, p: Dict[str, Any], *, delete_source
     copy_properties, copy_err = _normalize_copy_properties(p.get("copy_properties", p.get("copyProperties")))
     if copy_err:
         return copy_err
-    if p.get("copy_keyframes", p.get("copyKeyframes", False)) and "keyframes" not in copy_properties:
+    if _coerce_bool(p.get("copy_keyframes", p.get("copyKeyframes")), False) and "keyframes" not in copy_properties:
         copy_properties.append("keyframes")
     try:
         offset = int(p.get("record_frame_offset", p.get("recordFrameOffset", 0)))
@@ -4867,7 +4907,7 @@ def _timeline_duplicate_clips_impl(proj, tl, p: Dict[str, Any], *, delete_source
             seen_ids.add(sid)
 
     include_types = _normalize_include_linked(p.get("include_linked", p.get("includeLinked")))
-    relink = bool(p.get("relink", p.get("restore_linked", p.get("restoreLinked", bool(include_types)))))
+    relink = _coerce_bool(p.get("relink", p.get("restore_linked", p.get("restoreLinked"))), bool(include_types))
     results: List[Dict[str, Any]] = []
     source_delete_items = []
 
@@ -5043,7 +5083,7 @@ def _timeline_duplicate_clips_impl(proj, tl, p: Dict[str, Any], *, delete_source
                 seen_delete_ids.add(item_id)
         if delete_items:
             try:
-                out["deleted_sources"] = _timeline_delete_clips_verified(tl, delete_items, bool(p.get("ripple", False)), resolve=resolve)
+                out["deleted_sources"] = _timeline_delete_clips_verified(tl, delete_items, _coerce_bool(p.get("ripple")), resolve=resolve)
                 out["deleted_source_ids"] = _timeline_item_ids(delete_items)
             except Exception as exc:
                 out["deleted_sources"] = False
@@ -5312,7 +5352,7 @@ def _timeline_ripple_insert_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -
         if locked_tracks:
             reasons.append(f"locked track(s) hold items that must shift: {', '.join(locked_tracks)}")
         plan["infeasible_reasons"] = reasons
-    if bool(p.get("dry_run", True)):
+    if _coerce_bool(p.get("dry_run"), True):
         return {"success": feasible, "dry_run": True, "plan": plan}
     if not feasible:
         return {
@@ -5479,7 +5519,7 @@ def _timeline_ripple_insert_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -
 
 
 def _range_frames_from_params(tl, p: Dict[str, Any]):
-    if p.get("use_mark_in_out", p.get("useMarkInOut", False)):
+    if _coerce_bool(p.get("use_mark_in_out", p.get("useMarkInOut")), False):
         mark = tl.GetMarkInOut() or {}
         mark_type = p.get("mark_type", p.get("markType", "video"))
         if mark_type not in mark:
@@ -5561,7 +5601,7 @@ def _timeline_copy_range_impl(proj, tl, p: Dict[str, Any], *, overwrite: bool = 
     copy_properties, copy_err = _normalize_copy_properties(p.get("copy_properties", p.get("copyProperties")))
     if copy_err:
         return copy_err
-    if p.get("copy_keyframes", p.get("copyKeyframes", False)) and "keyframes" not in copy_properties:
+    if _coerce_bool(p.get("copy_keyframes", p.get("copyKeyframes")), False) and "keyframes" not in copy_properties:
         copy_properties.append("keyframes")
     mp = proj.GetMediaPool()
     if not mp:
@@ -5649,7 +5689,7 @@ def _timeline_lift_range_impl(tl, p: Dict[str, Any], *, resolve=None):
     start, end, items, err = _collect_timeline_items_in_range(tl, p)
     if err:
         return err
-    allow_partial = bool(p.get("allow_partial_item_delete", p.get("allowPartialItemDelete", False)))
+    allow_partial = _coerce_bool(p.get("allow_partial_item_delete", p.get("allowPartialItemDelete")))
     delete_items = []
     blocked = []
     for _, _, item, overlap_start, overlap_end in items:
@@ -5675,7 +5715,7 @@ def _timeline_lift_range_impl(tl, p: Dict[str, Any], *, resolve=None):
         return {"success": True, "deleted": 0, "range": {"start": start, "end": end}}
     deleted_ids = _timeline_item_ids(delete_items)
     return {
-        "success": _timeline_delete_clips_verified(tl, delete_items, bool(p.get("ripple", False)), resolve=resolve),
+        "success": _timeline_delete_clips_verified(tl, delete_items, _coerce_bool(p.get("ripple")), resolve=resolve),
         "deleted": len(delete_items),
         "deleted_ids": deleted_ids,
         "range": {"start": start, "end": end},
@@ -5824,7 +5864,7 @@ def _timeline_item_probe(item):
 
 def _timeline_probe_edit_kernel_item(tl, p: Dict[str, Any]):
     ids = p.get("clip_ids") or p.get("ids")
-    selected = bool(p.get("selected", False))
+    selected = _coerce_bool(p.get("selected"), False)
     items = []
     if ids:
         if not isinstance(ids, list):
@@ -5971,10 +6011,10 @@ def _timeline_set_title_text(tl, p: Dict[str, Any]) -> Dict[str, Any]:
         return _err("set_title_text requires params.text (string)")
 
     property_key = p.get("property_key") or p.get("key")
-    as_styled_xml = bool(p.get("as_styled_xml", p.get("styled", False)))
-    try_plain_first = bool(p.get("try_plain_first", True))
-    readback = bool(p.get("readback", False))
-    try_heuristic_keys = bool(p.get("try_heuristic_keys", not bool(property_key)))
+    as_styled_xml = _coerce_bool(p.get("as_styled_xml", p.get("styled")), False)
+    try_plain_first = _coerce_bool(p.get("try_plain_first"), True)
+    readback = _coerce_bool(p.get("readback"), False)
+    try_heuristic_keys = _coerce_bool(p.get("try_heuristic_keys"), not bool(property_key))
 
     if as_styled_xml:
         payload_modes = [(text, "as_given")]
@@ -6030,7 +6070,7 @@ def _timeline_set_title_text(tl, p: Dict[str, Any]) -> Dict[str, Any]:
     # route get_title_text already reads. Deliberately a bare, UNLOCKED
     # SetInput: the comp-lock render bug (api_truth / v2.98.5) eats writes
     # wrapped in Comp.Lock(), and unlocked writes are the safe ones.
-    if not bool(p.get("as_styled_xml", p.get("styled", False))):
+    if not _coerce_bool(p.get("as_styled_xml", p.get("styled")), False):
         try:
             if int(item.GetFusionCompCount() or 0) > 0:
                 comp = item.GetFusionCompByIndex(1)
@@ -6223,8 +6263,8 @@ def _timeline_item_conform_summary(item, track_type: str, track_index: int, item
 
 def _timeline_conform_snapshot(tl, p: Optional[Dict[str, Any]] = None):
     p = p or {}
-    include_markers = bool(p.get("include_markers", True))
-    include_clip_properties = bool(p.get("include_clip_properties", False))
+    include_markers = _coerce_bool(p.get("include_markers"), True)
+    include_clip_properties = _coerce_bool(p.get("include_clip_properties"), False)
     track_types = p.get("track_types") or ["video", "audio", "subtitle"]
     if not isinstance(track_types, list):
         return _err("track_types must be a list")
@@ -6310,7 +6350,7 @@ def _detect_gaps_overlaps_from_snapshot(snapshot: Dict[str, Any], p: Optional[Di
 def _source_ranges_from_snapshot(snapshot: Dict[str, Any], p: Optional[Dict[str, Any]] = None):
     p = p or {}
     handles = int(p.get("handles", 0))
-    merge = bool(p.get("merge", True))
+    merge = _coerce_bool(p.get("merge"), True)
     ranges: Dict[str, List[List[int]]] = {}
     occurrences = []
     for track_type, type_payload in (snapshot.get("tracks") or {}).items():
@@ -6438,7 +6478,7 @@ def _timeline_story_spine_report(tl, p: Dict[str, Any]) -> Dict[str, Any]:
     snapshot = _timeline_conform_snapshot(tl, {
         "track_types": p.get("track_types") or ["video", "audio", "subtitle"],
         "include_markers": True,
-        "include_clip_properties": bool(p.get("include_clip_properties", False)),
+        "include_clip_properties": _coerce_bool(p.get("include_clip_properties"), False),
     })
     if isinstance(snapshot, dict) and snapshot.get("error"):
         return snapshot
@@ -6468,8 +6508,8 @@ def _timeline_bulk_set_item_properties(tl, p: Dict[str, Any]) -> Dict[str, Any]:
     ops = p.get("ops")
     if not isinstance(ops, list) or not ops:
         return _err("bulk_set_item_properties requires params.ops: non-empty list of objects")
-    dry_run = bool(p.get("dry_run", False))
-    readback = bool(p.get("readback", False))
+    dry_run = _coerce_bool(p.get("dry_run"), False)
+    readback = _coerce_bool(p.get("readback"), False)
     results = []
     for index, op in enumerate(ops):
         if not isinstance(op, dict):
@@ -6562,7 +6602,7 @@ def _timeline_apply_look_to_items(tl, p: Dict[str, Any]) -> Dict[str, Any]:
         return _err("apply_look_to_items requires target_ids: non-empty list of video timeline item IDs")
     targets, missing = _timeline_items_by_ids_report(tl, target_ids, track_types=("video",))
     target_summaries = [_timeline_item_summary(item) for item in targets]
-    dry_run = bool(p.get("dry_run", False))
+    dry_run = _coerce_bool(p.get("dry_run"), False)
     out: Dict[str, Any] = {
         "targets": target_summaries,
         "missing": missing,
@@ -6629,7 +6669,7 @@ def _timeline_apply_look_to_items(tl, p: Dict[str, Any]) -> Dict[str, Any]:
             out["copy_grades"] = False
             out["copy_grades_error"] = str(exc)
     out["success"] = (
-        all(row.get("set_cdl", True) for row in results)
+        all(_coerce_bool(row.get("set_cdl"), True) for row in results)
         and (source_item is None or bool(out.get("copy_grades")))
     )
     return out
@@ -6773,7 +6813,7 @@ def _timeline_create_variant_from_ranges(proj, source_tl, p: Dict[str, Any]) -> 
     # pack=True butts clips together at the end of each track (record_frame is
     # ignored); Resolve packs by actual placed duration, so the result is gap-free
     # even when source and timeline frame rates differ.
-    pack = bool(p.get("pack", False))
+    pack = _coerce_bool(p.get("pack"), False)
     built = []
     cursor_by_track: Dict[Tuple[int, int], int] = {}
     max_tracks = {"video": 1, "audio": 1}
@@ -6821,7 +6861,7 @@ def _timeline_create_variant_from_ranges(proj, source_tl, p: Dict[str, Any]) -> 
         if clip_err:
             return clip_err
         append_infos.append(clip_info)
-    if p.get("dry_run", False):
+    if _coerce_bool(p.get("dry_run"), False):
         return {
             "success": True,
             "dry_run": True,
@@ -7282,7 +7322,7 @@ def _export_timeline_checked(tl, p: Dict[str, Any]):
     path = p.get("path")
     if not path:
         return _err("path is required")
-    if p.get("require_temp_path", True) and not _render_temp_path_ok(path):
+    if _coerce_bool(p.get("require_temp_path"), True) and not _render_temp_path_ok(path):
         return _err("path must be under the system temp directory unless require_temp_path=False")
     folder = os.path.dirname(os.path.abspath(path))
     if folder:
@@ -7311,7 +7351,7 @@ def _export_timeline_checked(tl, p: Dict[str, Any]):
                 "EXPORT_FCPXML_1_8/1_9/1_10, EXPORT_OTIO (subtypes EXPORT_NONE, "
                 "EXPORT_AAF_NEW, EXPORT_AAF_EXISTING, EXPORT_CDL, EXPORT_SDL, EXPORT_MISSING_CLIPS)."
             )
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(path=path, would_export=True, spec={k: v for k, v in spec.items() if k != "export_type"})
 
     def _work():
@@ -7663,7 +7703,7 @@ def _import_timeline_checked(proj, mp, p: Dict[str, Any]):
             "the media pool afterward (see `relink`)."
         )
     sanitize = sanitize_requested and not is_binary and not is_json
-    if not sanitize and p.get("require_temp_path", True) and not _render_temp_path_ok(path):
+    if not sanitize and _coerce_bool(p.get("require_temp_path"), True) and not _render_temp_path_ok(path):
         return _err(
             "path must be under the system temp directory unless require_temp_path=False",
             remediation="Pass require_temp_path=False to import from this location, or "
@@ -7692,7 +7732,7 @@ def _import_timeline_checked(proj, mp, p: Dict[str, Any]):
             san_kwargs["search_roots"] = list(search_roots)
             if p.get("relink_min_confidence") is not None:
                 san_kwargs["min_confidence"] = float(p["relink_min_confidence"])
-            if p.get("verify_visually") or p.get("reference_movie"):
+            if _coerce_bool(p.get("verify_visually")) or p.get("reference_movie"):
                 san_kwargs["verify_visually"] = True
             if p.get("reference_movie"):
                 san_kwargs["reference_movie"] = p["reference_movie"]
@@ -7730,7 +7770,7 @@ def _import_timeline_checked(proj, mp, p: Dict[str, Any]):
         if sequence_name_rewritten:
             import_path = rewritten_path
 
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         out = _ok(path=path, import_path=import_path, options=options, would_import=True)
         if sanitize_report is not None:
             out["sanitize"] = sanitize_report
@@ -8128,7 +8168,7 @@ def _import_from_drp(proj, mp, p: Dict[str, Any]):
             entry.update(success=False, error=f"extract failed: {e}")
             results.append(entry)
             continue
-        if p.get("dry_run"):
+        if _coerce_bool(p.get("dry_run")):
             entry.update(success=True, would_import=True, drt_path=drt_path)
             results.append(entry)
             continue
@@ -8151,15 +8191,15 @@ def _import_from_drp(proj, mp, p: Dict[str, Any]):
         imported=imported_count,
         available=available,
         results=results,
-        dry_run=bool(p.get("dry_run")),
+        dry_run=_coerce_bool(p.get("dry_run")),
     )
-    if not p.get("dry_run") and selected and imported_count == 0:
+    if not _coerce_bool(p.get("dry_run")) and selected and imported_count == 0:
         out["success"] = False
         out["error"] = (
             f"None of the {len(selected)} selected timeline(s) imported — "
             "see results[].error for each cause."
         )
-    elif not p.get("dry_run") and imported_count < len(selected):
+    elif not _coerce_bool(p.get("dry_run")) and imported_count < len(selected):
         out["partial"] = True
         out["warning"] = (
             f"{imported_count} of {len(selected)} selected timeline(s) "
@@ -8337,14 +8377,14 @@ def _compare_timelines(proj, tl, p: Dict[str, Any]):
 
 def _probe_interchange_roundtrip(proj, mp, tl, p: Dict[str, Any]):
     output_dir = p.get("output_dir") or tempfile.mkdtemp(prefix="mcp_conform_roundtrip_")
-    if p.get("require_temp_path", True) and not _render_temp_path_ok(output_dir):
+    if _coerce_bool(p.get("require_temp_path"), True) and not _render_temp_path_ok(output_dir):
         return _err("output_dir must be under the system temp directory unless require_temp_path=False")
     os.makedirs(output_dir, exist_ok=True)
     spec = _timeline_export_spec(p, resolve)
     base_name = p.get("name") or f"roundtrip_{str(spec['requested']).lower()}"
     path = p.get("path") or os.path.join(output_dir, base_name + spec["extension"])
     # background is a top-level option; a sub-step export must run synchronously.
-    export_result = _export_timeline_checked(tl, {**p, "path": path, "require_temp_path": p.get("require_temp_path", True), "background": False, "async_job": False})
+    export_result = _export_timeline_checked(tl, {**p, "path": path, "require_temp_path": _coerce_bool(p.get("require_temp_path"), True), "background": False, "async_job": False})
     if export_result.get("error") or not export_result.get("success"):
         return {"success": False, "stage": "export", "export": export_result}
     import_path = export_result.get("primary_file") or export_result.get("path") or path
@@ -8352,14 +8392,14 @@ def _probe_interchange_roundtrip(proj, mp, tl, p: Dict[str, Any]):
     requested_key = str(spec["requested"]).lower()
     if "drt" not in requested_key:
         import_options.setdefault("timelineName", p.get("imported_timeline_name", f"{tl.GetName()} {spec['requested']} Roundtrip"))
-        import_options.setdefault("importSourceClips", bool(p.get("import_source_clips", False)))
+        import_options.setdefault("importSourceClips", _coerce_bool(p.get("import_source_clips"), False))
     import_result = _import_timeline_checked(
         proj,
         mp,
         {
             "path": import_path,
             "options": import_options,
-            "require_temp_path": p.get("require_temp_path", True),
+            "require_temp_path": _coerce_bool(p.get("require_temp_path"), True),
         },
     )
     if import_result.get("error") or not import_result.get("success"):
@@ -8371,7 +8411,7 @@ def _probe_interchange_roundtrip(proj, mp, tl, p: Dict[str, Any]):
     if imported_tl:
         comparison = _compare_timeline_snapshots(_timeline_conform_snapshot(tl, p), _timeline_conform_snapshot(imported_tl, p))
     cleanup_result = None
-    if p.get("cleanup_imported", True) and imported_tl:
+    if _coerce_bool(p.get("cleanup_imported"), True) and imported_tl:
         cleanup_result = {"success": bool(mp.DeleteTimelines([imported_tl]))}
     return {
         "success": True,
@@ -8566,13 +8606,13 @@ def _detect_missing_media_from_snapshot(snapshot: Dict[str, Any]):
 def _detect_missing_media(tl, p: Dict[str, Any]):
     snapshot = _timeline_conform_snapshot(tl, {**p, "include_clip_properties": True})
     report = _detect_missing_media_from_snapshot(snapshot)
-    if p.get("sanitize_paths") or p.get("sanitized"):
+    if _coerce_bool(p.get("sanitize_paths")) or _coerce_bool(p.get("sanitized")):
         report = dict(report)
         report["missing"] = [
             {
                 **row,
                 "file_path_sanitized": _sanitize_media_path(row.get("file_path")),
-                "file_path": None if p.get("omit_raw_paths", True) else row.get("file_path"),
+                "file_path": None if _coerce_bool(p.get("omit_raw_paths"), True) else row.get("file_path"),
             }
             for row in report.get("missing", [])
         ]
@@ -8591,7 +8631,7 @@ def _bounded_basename_matches(
     max_files = max(1, int(p.get("max_files_scanned", p.get("maxFilesScanned", 50000)) or 50000))
     max_depth_raw = p.get("max_depth", p.get("maxDepth"))
     max_depth = int(max_depth_raw) if max_depth_raw is not None else None
-    all_matches = bool(p.get("all_matches", False))
+    all_matches = _coerce_bool(p.get("all_matches"), False)
     matches: List[str] = []
     files_scanned = 0
     dirs_scanned = 0
@@ -8641,7 +8681,7 @@ def _build_relink_plan(tl, p: Dict[str, Any]):
         return _err(f"search_roots must be existing directories: {invalid}")
     missing_report = _detect_missing_media(tl, p)
     diagnosis = missing_report.get("diagnosis") or _missing_media_diagnosis(missing_report.get("missing", []))
-    if p.get("skip_search_when_volume_missing", True) and any(
+    if _coerce_bool(p.get("skip_search_when_volume_missing"), True) and any(
         not row.get("mounted") for row in diagnosis.get("missing_volumes", [])
     ):
         return {
@@ -8674,7 +8714,7 @@ def _build_relink_plan(tl, p: Dict[str, Any]):
                 **row,
                 "wanted_basename": wanted,
                 "timeline_occurrence_count": len(rows),
-                "candidate_paths": [] if p.get("sanitize_paths") or p.get("sanitized") else matches,
+                "candidate_paths": [] if _coerce_bool(p.get("sanitize_paths")) or _coerce_bool(p.get("sanitized")) else matches,
                 "candidate_paths_sanitized": sanitized_matches,
                 "candidate_count": len(matches),
                 "scan": scan,
@@ -8683,7 +8723,7 @@ def _build_relink_plan(tl, p: Dict[str, Any]):
     return {
         "success": True,
         "dry_run": True,
-        "search_roots": [] if p.get("sanitize_paths") or p.get("sanitized") else search_roots,
+        "search_roots": [] if _coerce_bool(p.get("sanitize_paths")) or _coerce_bool(p.get("sanitized")) else search_roots,
         "search_roots_sanitized": [_sanitize_media_path(root, keep_filename=False) for root in search_roots],
         "candidate_count": sum(1 for row in candidates if row["candidate_count"]),
         "missing_count": missing_report.get("missing_count", 0),
@@ -8863,7 +8903,7 @@ def _safe_set_audio_properties(tl, p: Dict[str, Any]):
             original[key] = item.GetProperty(key)
         except Exception as exc:
             original[key] = {"error": str(exc)}
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(would_set=properties, original=original)
     results = {}
     for key, value in properties.items():
@@ -8877,7 +8917,7 @@ def _safe_set_audio_properties(tl, p: Dict[str, Any]):
             row["readback"] = item.GetProperty(key)
         except Exception as exc:
             row["readback_error"] = str(exc)
-        if p.get("restore", True) and not isinstance(original.get(key), dict):
+        if _coerce_bool(p.get("restore"), True) and not isinstance(original.get(key), dict):
             try:
                 row["restore"] = bool(item.SetProperty(key, original[key]))
             except Exception as exc:
@@ -9032,7 +9072,7 @@ def _safe_auto_sync_audio(mp, p: Dict[str, Any]):
     # here makes _normalize_auto_sync_settings fall back to string enum keys,
     # which AutoSyncAudio silently rejects (returns False).
     settings, ignored_settings = _normalize_auto_sync_settings(dict(p.get("settings") or {}), get_resolve())
-    if p.get("dry_run", True):
+    if _coerce_bool(p.get("dry_run"), True):
         return _ok(would_auto_sync=True, clips=_clip_summaries(clips), missing=missing, settings=settings, ignored_settings=ignored_settings)
     # Read-back verification: AutoSyncAudio's boolean return is unreliable, so
     # capture each clip's "Synced Audio" linkage before and after and report the
@@ -9282,7 +9322,7 @@ def _safe_create_subtitles(tl, p: Dict[str, Any]):
     the timeline's subtitle track count before/after and report the real delta.
     """
     settings, ignored = _normalize_auto_caption_settings(p.get("settings"), get_resolve())
-    if p.get("dry_run", False):
+    if _coerce_bool(p.get("dry_run"), False):
         return _ok(would_create_subtitles=True, settings=settings, ignored_settings=ignored)
 
     def _subtitle_track_count():
@@ -9322,7 +9362,7 @@ def _transcription_capabilities(mp, p: Dict[str, Any]):
             return _err("clip_ids must be a list")
         clips = [_find_clip(root, str(clip_id)) for clip_id in ids]
         clips = [clip for clip in clips if clip]
-    elif p.get("selected"):
+    elif _coerce_bool(p.get("selected")):
         clips = mp.GetSelectedClips() or []
     current_folder = mp.GetCurrentFolder()
     return {
@@ -9359,7 +9399,7 @@ def _transcription_capabilities(mp, p: Dict[str, Any]):
 
 def _subtitle_generation_probe(tl, p: Dict[str, Any]):
     settings, ignored = _normalize_auto_caption_settings(p.get("settings"), get_resolve())
-    if not p.get("allow_generate", False):
+    if not _coerce_bool(p.get("allow_generate")):
         return _ok(would_generate=True, settings=settings, ignored_settings=ignored,
                    note="Pass allow_generate=True to call CreateSubtitlesFromAudio.")
     if not _has_method(tl, "CreateSubtitlesFromAudio"):
@@ -9564,7 +9604,7 @@ def _setup_multicam_timeline(proj, mp, p: Dict[str, Any]):
     plan, plan_err = build_multicam_setup_plan(root, p, _find_clip)
     if plan_err:
         return plan_err
-    if p.get("dry_run", False):
+    if _coerce_bool(p.get("dry_run"), False):
         return {
             **plan,
             "dry_run": True,
@@ -10261,7 +10301,7 @@ def _media_analysis_records_from_target(mp, p: Dict[str, Any], project=None) -> 
 
     elif target_type == "clip":
         clip_id = target.get("clip_id") or p.get("clip_id")
-        selected = bool(target.get("selected") or p.get("selected"))
+        selected = bool(_coerce_bool(target.get("selected")) or _coerce_bool(p.get("selected")))
         clips = []
         if selected:
             try:
@@ -10323,7 +10363,7 @@ def _media_analysis_records_from_target(mp, p: Dict[str, Any], project=None) -> 
         target.update({"type": "clips", "clip_ids": clip_ids, "skipped": skipped})
     elif target_type == "bin":
         path = target.get("path") or p.get("bin_path") or p.get("path") or "Master"
-        recursive = bool(target.get("recursive", p.get("recursive", True)))
+        recursive = _coerce_bool(target.get("recursive", p.get("recursive")), True)
         folder = _navigate_folder(mp, path)
         if not folder:
             return None, target, warnings, _err(f"Folder not found: {path}")
@@ -10331,14 +10371,14 @@ def _media_analysis_records_from_target(mp, p: Dict[str, Any], project=None) -> 
         warnings.extend(folder_warnings)
         target.update({"type": "bin", "path": path, "recursive": recursive})
     elif target_type == "project":
-        recursive = bool(target.get("recursive", True))
+        recursive = _coerce_bool(target.get("recursive"), True)
         records, folder_warnings = _media_analysis_folder_records(mp.GetRootFolder(), "Master", recursive=recursive)
         warnings.extend(folder_warnings)
         target.update({"type": "project", "recursive": recursive})
     else:
         return None, target, warnings, _err("target.type must be one of file, clip, clips, bin, project, sequence, timeline")
 
-    records, duplicate_count = _media_analysis_dedupe_records(records, bool(p.get("include_duplicates", target.get("include_duplicates", False))))
+    records, duplicate_count = _media_analysis_dedupe_records(records, _coerce_bool(p.get("include_duplicates", target.get("include_duplicates")), False))
     if duplicate_count:
         warnings.append(f"Deduped {duplicate_count} repeated source media reference(s)")
     if not records:
@@ -12450,7 +12490,7 @@ def _media_analysis_metadata_writeback_enabled(p: Dict[str, Any]) -> bool:
         "writeToResolve",
     )
     if raw is None:
-        return bool(_media_analysis_effective_preferences().get("metadata_writeback_default", True))
+        return _coerce_bool(_media_analysis_effective_preferences().get("metadata_writeback_default"), True)
     return _media_analysis_bool(raw, True)
 
 
@@ -12713,7 +12753,7 @@ def _media_analysis_apply_setup_defaults(action: str, p: Dict[str, Any]) -> Dict
             "write_to_resolve",
             "writeToResolve",
         ):
-            out["publish_metadata"] = bool(prefs.get("metadata_writeback_default", True))
+            out["publish_metadata"] = _coerce_bool(prefs.get("metadata_writeback_default"), True)
             applied["metadata_writeback_default"] = out["publish_metadata"]
 
         persistence = prefs.get("analysis_persistence")
@@ -13286,7 +13326,7 @@ def _media_pool_probe(mp, p: Dict[str, Any]):
 def _media_pool_probe_ingest_items(mp, p: Dict[str, Any]):
     root = mp.GetRootFolder()
     ids = p.get("clip_ids") or p.get("ids")
-    selected = bool(p.get("selected", False))
+    selected = _coerce_bool(p.get("selected"), False)
     clips = []
     warnings = []
     if ids:
@@ -13337,7 +13377,7 @@ def _string_list_param(p: Dict[str, Any], key: str):
 
 def _clips_from_params(root, mp, p: Dict[str, Any], *, key: str = "clip_ids"):
     ids = p.get(key) or p.get("ids")
-    selected = bool(p.get("selected", False))
+    selected = _coerce_bool(p.get("selected"), False)
     clips = []
     missing = []
     if ids:
@@ -13465,7 +13505,7 @@ def _safe_import_media(mp, p: Dict[str, Any]):
             errors.append(path_err)
     if errors:
         return _err("; ".join(errors))
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(would_import=paths, target_folder=p.get("target_folder"))
     previous, folder_err = _set_current_folder_temporarily(mp, p.get("target_folder"))
     if folder_err:
@@ -13495,7 +13535,7 @@ def _safe_import_sequence(mp, p: Dict[str, Any]):
         suffix = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
         return _err(f"Missing sequence frames: {sample}{suffix}")
     info = {"FilePath": pattern, "StartIndex": start, "EndIndex": end}
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(would_import=[info], target_folder=p.get("target_folder"))
     previous, folder_err = _set_current_folder_temporarily(mp, p.get("target_folder"))
     if folder_err:
@@ -13511,7 +13551,7 @@ def _safe_import_folder(mp, p: Dict[str, Any]):
     path_err = _path_error(path, must_be_dir=True)
     if path_err:
         return _err(path_err)
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(would_import_folder=path, source_clips_path=p.get("source_clips_path", ""))
     return {"success": bool(mp.ImportFolderFromFile(path, p.get("source_clips_path", "")))}
 
@@ -13520,7 +13560,7 @@ def _organize_clips(mp, root, p: Dict[str, Any]):
     target_path = p.get("target_path")
     if not target_path:
         return _err("target_path is required")
-    if p.get("create_missing"):
+    if _coerce_bool(p.get("create_missing")):
         target, target_err = _ensure_folder_path(mp, target_path)
     else:
         target = _navigate_folder(mp, target_path)
@@ -13531,7 +13571,7 @@ def _organize_clips(mp, root, p: Dict[str, Any]):
     if err:
         return err
     clips, missing = resolved
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(target_path=target_path, clips=_clip_summaries(clips), missing=missing)
     return {"success": bool(mp.MoveClips(clips, target)), "moved": len(clips), "missing": missing}
 
@@ -13548,7 +13588,7 @@ def _copy_metadata(root, p: Dict[str, Any]):
         keys = set(p["keys"])
         metadata = {key: value for key, value in metadata.items() if key in keys}
     third_party = {}
-    if p.get("include_third_party", True):
+    if _coerce_bool(p.get("include_third_party"), True):
         third_party = source.GetThirdPartyMetadata("") or {}
     results = []
     for target_id in target_ids:
@@ -13556,7 +13596,7 @@ def _copy_metadata(root, p: Dict[str, Any]):
         if not target:
             results.append({"clip_id": target_id, "success": False, "error": "Clip not found"})
             continue
-        if p.get("dry_run"):
+        if _coerce_bool(p.get("dry_run")):
             results.append({"clip_id": target_id, "success": True, "metadata_keys": sorted(metadata.keys()), "third_party_keys": sorted(third_party.keys())})
             continue
         ok = bool(target.SetMetadata(metadata)) if metadata else True
@@ -13581,7 +13621,7 @@ def _normalize_metadata(root, mp, p: Dict[str, Any]):
     results = []
     for clip in clips:
         clip_id = _safe_media_pool_item_id(clip)
-        if p.get("dry_run"):
+        if _coerce_bool(p.get("dry_run")):
             results.append({"clip_id": clip_id, "success": True, "metadata_keys": sorted(metadata.keys()), "third_party_keys": sorted(third_party.keys())})
             continue
         ok = bool(clip.SetMetadata(metadata)) if metadata else True
@@ -13719,7 +13759,7 @@ def _safe_relink(mp, root, p: Dict[str, Any]):
     if err:
         return err
     clips, missing = resolved
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(folder_path=folder_path, clips=_clip_summaries(clips), missing=missing)
     return {"success": bool(mp.RelinkClips(clips, folder_path)), "count": len(clips), "missing": missing}
 
@@ -13729,7 +13769,7 @@ def _safe_unlink(mp, root, p: Dict[str, Any]):
     if err:
         return err
     clips, missing = resolved
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(clips=_clip_summaries(clips), missing=missing)
     return {"success": bool(mp.UnlinkClips(clips)), "count": len(clips), "missing": missing}
 
@@ -14229,6 +14269,35 @@ def _append_to_timeline_verified_operation(requested: Dict[str, Any], verificati
     )
 
 
+def _append_to_timeline_failed(message: str, result, requested: Dict[str, Any], verification: Dict[str, Any], before):
+    """AppendToTimeline answered None/False/[]: an error that keeps the readback.
+
+    The answer alone does not prove nothing landed, so the call is retryable only
+    when the readback shows the timeline's item count unchanged; a retry after an
+    append that did land puts the clips on the timeline twice.
+    """
+    delta = verification.get("item_count_delta")
+    nothing_landed = delta == 0
+    out = _err(
+        message,
+        code="APPEND_TO_TIMELINE_FAILED",
+        category="resolve_api_failed",
+        retryable=nothing_landed,
+        reason=f"MediaPool.AppendToTimeline returned {result!r}",
+        remediation=(
+            "Nothing was appended. Check that the intended timeline is current and the clips can go on it, then retry."
+            if nothing_landed else
+            "The readback cannot rule out that clips were appended; inspect the current timeline before retrying so nothing is appended twice."
+        ),
+        state={
+            "expected_item_count_delta": verification.get("expected_item_count_delta"),
+            "item_count_delta": delta,
+        },
+    )
+    out["verified_operation"] = _append_to_timeline_verified_operation(requested, verification, before)
+    return out
+
+
 def _link_proxy_checked(root, p: Dict[str, Any]):
     clip = _find_clip(root, p.get("clip_id", ""))
     if not clip:
@@ -14242,7 +14311,7 @@ def _link_proxy_checked(root, p: Dict[str, Any]):
         return missing
     check_compatibility = bool(
         p.get("check_compatibility")
-        or p.get("require_compatible")
+        or _coerce_bool(p.get("require_compatible"))
         or p.get("expected_codec")
         or p.get("expected_profile")
         or p.get("codec")
@@ -14259,9 +14328,9 @@ def _link_proxy_checked(root, p: Dict[str, Any]):
     requested = {
         "clip_id": p.get("clip_id"),
         "proxy_path": proxy_path,
-        "dry_run": bool(p.get("dry_run")),
+        "dry_run": _coerce_bool(p.get("dry_run")),
         "check_compatibility": check_compatibility,
-        "require_compatible": bool(p.get("require_compatible")),
+        "require_compatible": _coerce_bool(p.get("require_compatible")),
         "expected_codec": p.get("expected_codec") or p.get("codec"),
         "expected_profile": p.get("expected_profile") or p.get("profile"),
     }
@@ -14274,7 +14343,7 @@ def _link_proxy_checked(root, p: Dict[str, Any]):
     }
     if compatibility is not None:
         preflight["compatible"] = bool(compatibility.get("compatible"))
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         out = _ok(clip=_media_pool_item_summary(clip), proxy_path=proxy_path)
         if compatibility is not None:
             out["compatibility"] = compatibility
@@ -14295,7 +14364,7 @@ def _link_proxy_checked(root, p: Dict[str, Any]):
             ),
         )
         return out
-    if p.get("require_compatible") and compatibility is not None and not compatibility.get("compatible"):
+    if _coerce_bool(p.get("require_compatible")) and compatibility is not None and not compatibility.get("compatible"):
         out = _err(
             "Proxy media is not compatible with the source clip; refusing LinkProxyMedia",
             code="PROXY_INCOMPATIBLE",
@@ -14367,7 +14436,7 @@ def _link_full_resolution_checked(root, p: Dict[str, Any]):
     path_err = _path_error(path, must_be_file=True)
     if path_err:
         return _err(path_err)
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(clip=_media_pool_item_summary(clip), path=path)
     return {"success": bool(clip.LinkFullResolutionMedia(path))}
 
@@ -14385,7 +14454,7 @@ def _set_clip_marks(root, mp, p: Dict[str, Any]):
     results = []
     for clip in clips:
         clip_id = _safe_media_pool_item_id(clip)
-        if p.get("dry_run"):
+        if _coerce_bool(p.get("dry_run")):
             results.append({"clip_id": clip_id, "success": True, "mark_in": mark_in, "mark_out": mark_out})
             continue
         results.append({"clip_id": clip_id, "success": bool(clip.SetMarkInOut(mark_in, mark_out, p.get("type", "all")))})
@@ -14572,7 +14641,7 @@ def _clear_clip_marks(root, mp, p: Dict[str, Any]):
     results = []
     for clip in clips:
         clip_id = _safe_media_pool_item_id(clip)
-        if p.get("dry_run"):
+        if _coerce_bool(p.get("dry_run")):
             results.append({"clip_id": clip_id, "success": True})
             continue
         results.append({"clip_id": clip_id, "success": bool(clip.ClearMarkInOut(p.get("type", "all")))})
@@ -14589,16 +14658,16 @@ def _copy_clip_annotations(root, p: Dict[str, Any]):
     markers = source.GetMarkers() or {}
     flags = source.GetFlagList() or []
     color = source.GetClipColor()
-    include_markers = p.get("include_markers", True)
-    include_flags = p.get("include_flags", True)
-    include_color = p.get("include_clip_color", True)
+    include_markers = _coerce_bool(p.get("include_markers"), True)
+    include_flags = _coerce_bool(p.get("include_flags"), True)
+    include_color = _coerce_bool(p.get("include_clip_color"), True)
     results = []
     for target_id in target_ids:
         target = _find_clip(root, str(target_id))
         if not target:
             results.append({"clip_id": target_id, "success": False, "error": "Clip not found"})
             continue
-        if p.get("dry_run"):
+        if _coerce_bool(p.get("dry_run")):
             results.append({"clip_id": target_id, "success": True, "markers": len(markers), "flags": len(flags), "clip_color": color})
             continue
         ok = True
@@ -14629,7 +14698,7 @@ def _media_pool_boundary_report(mp, p: Dict[str, Any]):
         "capabilities": _media_pool_ingest_capabilities(),
         "media_pool": _media_pool_probe(mp, {"depth": p.get("depth", 1)}),
     }
-    if p.get("clip_ids") or p.get("selected"):
+    if p.get("clip_ids") or _coerce_bool(p.get("selected")):
         report["items"] = _media_pool_probe_ingest_items(mp, p)
     return report
 
@@ -17552,6 +17621,11 @@ def _control_panel_read_token() -> Optional[str]:
 _CONTROL_PANEL_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
+def _control_panel_url_host(host: str) -> str:
+    """Host as it goes in a URL: `::1` must be written `[::1]`."""
+    return f"[{host}]" if ":" in host else host
+
+
 def _control_panel_pid_alive(pid: int) -> bool:
     """Check whether a PID is alive on this OS without killing it."""
     if not pid or pid <= 0:
@@ -17639,7 +17713,7 @@ def _control_panel_probe(host: str, port: int, timeout: float = 1.5,
     """
     import urllib.error
     import urllib.request
-    url = f"http://{host}:{port}/api/boot"
+    url = f"http://{_control_panel_url_host(host)}:{port}/api/boot"
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     try:
         req = urllib.request.Request(url, headers=headers)
@@ -17899,7 +17973,7 @@ def _open_control_panel(p: Dict[str, Any]) -> Dict[str, Any]:
     # Write the pidfile so subsequent calls find it. The token travels in the
     # URL fragment — browsers never send fragments, so it stays out of every
     # request line and log.
-    url = f"http://{host}:{port}/#token={panel_token}"
+    url = f"http://{_control_panel_url_host(host)}:{port}/#token={panel_token}"
     state = {
         "pid": proc.pid,
         "port": port,
@@ -18305,9 +18379,9 @@ def _require_disposable_project_name(
     name: Any,
     *,
     field: str = "name",
-    allow_non_mcp_name: bool = False,
+    allow_non_mcp_name: Any = False,
 ) -> Optional[Dict[str, Any]]:
-    if allow_non_mcp_name:
+    if _coerce_bool(allow_non_mcp_name):
         if isinstance(name, str) and name:
             return None
         return _err(f"{field} must be a non-empty string")
@@ -18490,7 +18564,7 @@ def _probe_project_settings(project, p: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as exc:
             row["error"] = str(exc)
         out["candidate_settings"][key] = row
-    if p.get("try_write"):
+    if _coerce_bool(p.get("try_write")):
         settings = {
             key: row["value"]
             for key, row in out["candidate_settings"].items()
@@ -18500,7 +18574,7 @@ def _probe_project_settings(project, p: Dict[str, Any]) -> Dict[str, Any]:
             out["write_restore_probe"] = _safe_set_project_settings(project, {
                 "settings": settings,
                 "restore": True,
-                "dry_run": bool(p.get("dry_run", False)),
+                "dry_run": _coerce_bool(p.get("dry_run"), False),
             })
     return out
 
@@ -18517,8 +18591,8 @@ def _safe_set_project_settings(project, p: Dict[str, Any]) -> Dict[str, Any]:
             original[key] = _ser(project.GetSetting(key))
         except Exception as exc:
             original[key] = {"error": str(exc)}
-    if p.get("dry_run"):
-        return _ok(would_set=settings, original=original, restore=p.get("restore", True))
+    if _coerce_bool(p.get("dry_run")):
+        return _ok(would_set=settings, original=original, restore=_coerce_bool(p.get("restore"), True))
     results: Dict[str, Any] = {}
     for key, value in settings.items():
         row: Dict[str, Any] = {"requested": value, "original": original.get(key)}
@@ -18531,7 +18605,7 @@ def _safe_set_project_settings(project, p: Dict[str, Any]) -> Dict[str, Any]:
             row["readback"] = _ser(project.GetSetting(key))
         except Exception as exc:
             row["readback_error"] = str(exc)
-        if p.get("restore", True) and not isinstance(original.get(key), dict):
+        if _coerce_bool(p.get("restore"), True) and not isinstance(original.get(key), dict):
             try:
                 row["restore"] = bool(project.SetSetting(key, original[key]))
                 row["restored_value"] = _ser(project.GetSetting(key))
@@ -18544,7 +18618,7 @@ def _safe_set_project_settings(project, p: Dict[str, Any]) -> Dict[str, Any]:
 
 def _safe_project_create(pm, resolve_obj, p: Dict[str, Any]) -> Dict[str, Any]:
     name = p.get("name")
-    invalid = _require_disposable_project_name(name, allow_non_mcp_name=p.get("allow_non_mcp_name", False))
+    invalid = _require_disposable_project_name(name, allow_non_mcp_name=_coerce_bool(p.get("allow_non_mcp_name"), False))
     if invalid:
         return invalid
     media_location_path = p.get("media_location_path") or p.get("mediaLocationPath")
@@ -18552,14 +18626,14 @@ def _safe_project_create(pm, resolve_obj, p: Dict[str, Any]) -> Dict[str, Any]:
         path_err = _project_path_guard(
             media_location_path,
             field="media_location_path",
-            require_temp_path=p.get("require_temp_media_location", True),
+            require_temp_path=_coerce_bool(p.get("require_temp_media_location"), True),
         )
         if path_err:
             return path_err
         version = resolve_obj.GetVersion() or [0]
         if version[0] < 20 or (version[0] == 20 and len(version) > 2 and (version[1], version[2]) < (2, 2)):
             return _err("ProjectManager.CreateProject media_location_path requires DaVinci Resolve 20.2.2+")
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(would_create=True, name=name, media_location_path=media_location_path)
     project = pm.CreateProject(name, media_location_path) if media_location_path else pm.CreateProject(name)
     return _ok(project=_project_object_summary(project), name=project.GetName()) if project else _err(f"Failed to create '{name}'")
@@ -18567,52 +18641,59 @@ def _safe_project_create(pm, resolve_obj, p: Dict[str, Any]) -> Dict[str, Any]:
 
 def _safe_project_export(pm, p: Dict[str, Any]) -> Dict[str, Any]:
     name = p.get("name")
-    invalid = _require_disposable_project_name(name, allow_non_mcp_name=p.get("allow_non_mcp_name", False))
+    invalid = _require_disposable_project_name(name, allow_non_mcp_name=_coerce_bool(p.get("allow_non_mcp_name"), False))
     if invalid:
         return invalid
     path = p.get("path")
-    path_err = _project_path_guard(path, require_temp_path=p.get("require_temp_path", True))
+    path_err = _project_path_guard(path, require_temp_path=_coerce_bool(p.get("require_temp_path"), True))
     if path_err:
         return path_err
     os.makedirs(_project_path_parent(path), exist_ok=True)
-    with_stills = bool(p.get("with_stills_and_luts", False))
-    if p.get("dry_run"):
+    with_stills = _coerce_bool(p.get("with_stills_and_luts"), False)
+    if _coerce_bool(p.get("dry_run")):
         return _ok(would_export=True, name=name, path=path, with_stills_and_luts=with_stills)
     return {"success": bool(pm.ExportProject(name, path, with_stills))}
 
 
 def _safe_project_import(pm, p: Dict[str, Any]) -> Dict[str, Any]:
     path = p.get("path")
-    path_err = _project_path_guard(path, require_temp_path=p.get("require_temp_path", True))
+    path_err = _project_path_guard(path, require_temp_path=_coerce_bool(p.get("require_temp_path"), True))
     if path_err:
         return path_err
     if not os.path.exists(path):
         return _err(f"path does not exist: {path}")
     name = p.get("name")
-    invalid = _require_disposable_project_name(name, allow_non_mcp_name=p.get("allow_non_mcp_name", False))
+    invalid = _require_disposable_project_name(name, allow_non_mcp_name=_coerce_bool(p.get("allow_non_mcp_name"), False))
     if invalid:
         return invalid
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(would_import=True, path=path, name=name)
     return {"success": bool(pm.ImportProject(path, name))}
 
 
 def _safe_project_archive(pm, p: Dict[str, Any]) -> Dict[str, Any]:
     name = p.get("name")
-    invalid = _require_disposable_project_name(name, allow_non_mcp_name=p.get("allow_non_mcp_name", False))
+    invalid = _require_disposable_project_name(name, allow_non_mcp_name=_coerce_bool(p.get("allow_non_mcp_name"), False))
     if invalid:
         return invalid
     path = p.get("path")
-    path_err = _project_path_guard(path, require_temp_path=p.get("require_temp_path", True))
+    path_err = _project_path_guard(path, require_temp_path=_coerce_bool(p.get("require_temp_path"), True))
     if path_err:
         return path_err
-    src_media = bool(p.get("src_media", False))
-    render_cache = bool(p.get("render_cache", False))
-    proxy_media = bool(p.get("proxy_media", False))
-    if (src_media or render_cache or proxy_media) and not p.get("allow_media_archive", False):
+    flags, flag_err = archive_guard.read_flags(p)
+    if flag_err:
+        return _err(flag_err, code="INVALID_ARCHIVE_FLAG", category="invalid_input")
+    src_media, render_cache, proxy_media = (flags["src_media"], flags["render_cache"],
+                                            flags["proxy_media"])
+    if (src_media or render_cache or proxy_media) and not _coerce_bool(p.get("allow_media_archive")):
         return _err("Archive media/cache/proxy flags must stay false unless allow_media_archive=True")
+    # allow_media_archive guards size; this guards the crash. Both are required.
+    if not _coerce_bool(p.get("acknowledge_trap")):
+        refused = archive_guard.crash_refusal("project_manager", "safe_project_archive", flags)
+        if refused:
+            return refused
     os.makedirs(_project_path_parent(path), exist_ok=True)
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(
             would_archive=True,
             name=name,
@@ -18621,31 +18702,32 @@ def _safe_project_archive(pm, p: Dict[str, Any]) -> Dict[str, Any]:
             render_cache=render_cache,
             proxy_media=proxy_media,
         )
-    return {"success": bool(pm.ArchiveProject(name, path, src_media, render_cache, proxy_media))}
+    native = pm.ArchiveProject(name, path, src_media, render_cache, proxy_media)
+    return archive_guard.outcome(native, flags, name=name, path=path)
 
 
 def _safe_project_restore(pm, p: Dict[str, Any]) -> Dict[str, Any]:
     path = p.get("path")
-    path_err = _project_path_guard(path, require_temp_path=p.get("require_temp_path", True))
+    path_err = _project_path_guard(path, require_temp_path=_coerce_bool(p.get("require_temp_path"), True))
     if path_err:
         return path_err
     if not os.path.exists(path):
         return _err(f"path does not exist: {path}")
     name = p.get("name")
-    invalid = _require_disposable_project_name(name, allow_non_mcp_name=p.get("allow_non_mcp_name", False))
+    invalid = _require_disposable_project_name(name, allow_non_mcp_name=_coerce_bool(p.get("allow_non_mcp_name"), False))
     if invalid:
         return invalid
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(would_restore=True, path=path, name=name)
     return {"success": bool(pm.RestoreProject(path, name))}
 
 
 def _safe_project_delete(pm, p: Dict[str, Any]) -> Dict[str, Any]:
     name = p.get("name")
-    invalid = _require_disposable_project_name(name, allow_non_mcp_name=p.get("allow_non_mcp_name", False))
+    invalid = _require_disposable_project_name(name, allow_non_mcp_name=_coerce_bool(p.get("allow_non_mcp_name"), False))
     if invalid:
         return invalid
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(would_delete=True, name=name)
     current = pm.GetCurrentProject()
     # Route through delete_project_safely: DeleteProject silently returns False
@@ -18653,9 +18735,9 @@ def _safe_project_delete(pm, p: Dict[str, Any]) -> Dict[str, Any]:
     from src.utils.project_cleanup import delete_project_safely
     current_name = current.GetName() if current and _has_method(current, "GetName") else None
     if current_name == name:
-        if not p.get("close_current", False):
+        if not _coerce_bool(p.get("close_current")):
             return _err("Refusing to delete the currently open project; pass close_current=True")
-        saved = bool(pm.SaveProject()) if p.get("save_current", True) else None
+        saved = bool(pm.SaveProject()) if _coerce_bool(p.get("save_current"), True) else None
         closed = bool(pm.CloseProject(current))
         if not closed:
             return _err(f"Failed to close current project '{name}' before delete")
@@ -18699,7 +18781,7 @@ def _safe_set_current_database(pm, p: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(db_info, dict) or not db_info.get("DbType") or not db_info.get("DbName"):
         return _err("db_info must include DbType and DbName")
     current = _ser(pm.GetCurrentDatabase()) if _has_method(pm, "GetCurrentDatabase") else None
-    dry_run = p.get("dry_run", True) or not p.get("allow_switch", False)
+    dry_run = _coerce_bool(p.get("dry_run"), True) or not _coerce_bool(p.get("allow_switch"))
     if dry_run:
         return _ok(
             would_switch=True,
@@ -19031,13 +19113,13 @@ def _spec_action(r, pm, action: str, p: Dict[str, Any]) -> Dict[str, Any]:
         return _ok(project=spec.project,
                    **_project_spec.apply_spec(spec, executor, dry_run=True))
     # apply_spec
-    run_hooks = bool(p.get("run_hooks", False))
+    run_hooks = _coerce_bool(p.get("run_hooks"), False)
     try:
         result = _project_spec.apply_spec(
             spec, executor,
-            dry_run=bool(p.get("dry_run", False)),
+            dry_run=_coerce_bool(p.get("dry_run"), False),
             run_hooks=run_hooks,
-            continue_on_error=bool(p.get("continue_on_error", False)),
+            continue_on_error=_coerce_bool(p.get("continue_on_error"), False),
             run_hook=_make_spec_hook_runner() if run_hooks else None,
         )
     except _project_spec.SpecError as exc:
@@ -19123,6 +19205,124 @@ def _project_lint_live(r, pm) -> Dict[str, Any]:
     return _ok(**_project_lint.lint_report(state))
 
 
+_SNAPSHOT_SECTIONS = ["project", "timeline", "gaps_overlaps", "render", "media_pool"]
+
+# The per-item fields a planning read needs. probe_timeline_structure carries
+# the rest (file path, media status, seconds, clip properties) for a caller
+# that wants them; repeating them here is what makes a 60-item readout too big
+# to be the first call of every turn.
+_SNAPSHOT_ITEM_FIELDS = (
+    "item_index", "timeline_item_id", "name", "start", "end",
+    "source_start", "source_end", "source_fps", "media_pool_item_id",
+)
+
+
+def _project_state_snapshot(r, proj, p: Dict[str, Any]) -> Dict[str, Any]:
+    """One read-only readout of the state an agent inspects before planning.
+
+    Composes the helpers behind project_summary, probe_timeline_structure,
+    detect_gaps_overlaps and the render status actions, so the numbers match
+    what those actions return. Each section fails on its own: an exception is
+    reported as that section's {"error"}, never as a whole-call failure.
+    """
+    include = p.get("include")
+    if include is None:
+        include = list(_SNAPSHOT_SECTIONS)
+    # An empty include is refused: falling back to every section would hand a
+    # caller that filtered down to nothing the most expensive read instead.
+    if not isinstance(include, list) or not include:
+        return _err("include must be a non-empty list", category="invalid_input")
+    unknown = [name for name in include if name not in _SNAPSHOT_SECTIONS]
+    if unknown:
+        return _err(
+            f"Unknown snapshot section(s): {unknown}",
+            code="UNKNOWN_SECTION", category="invalid_input",
+            state={"unknown": unknown, "supported": list(_SNAPSHOT_SECTIONS)},
+        )
+    track_types = p.get("track_types")
+    if track_types is not None and not isinstance(track_types, list):
+        return _err("track_types must be a list", category="invalid_input")
+    try:
+        item_limit = int(p.get("item_limit", 200))
+    except (TypeError, ValueError):
+        return _err("item_limit must be an integer", category="invalid_input")
+    if item_limit < 0:
+        return _err("item_limit must be 0 or greater", category="invalid_input")
+
+    out: Dict[str, Any] = {}
+
+    if "project" in include:
+        try:
+            section = _project_object_summary(proj) or {}
+            section["current_page"] = r.GetCurrentPage()
+            section["timeline_count"] = proj.GetTimelineCount()
+            section["settings"] = {
+                key: _ser(proj.GetSetting(key))
+                for key in ("timelineFrameRate", "timelineResolutionWidth", "timelineResolutionHeight")
+            }
+            out["project"] = section
+        except Exception as exc:
+            out["project"] = {"error": str(exc)}
+
+    if "timeline" in include or "gaps_overlaps" in include:
+        wanted = [name for name in ("timeline", "gaps_overlaps") if name in include]
+        try:
+            tl = proj.GetCurrentTimeline()
+            if not tl:
+                for name in wanted:
+                    out[name] = {"available": False, "error": "No current timeline"}
+            else:
+                snapshot = _timeline_conform_snapshot(
+                    tl, {"track_types": track_types, "include_markers": False})
+                # Gaps are measured on the whole snapshot, before item_limit
+                # trims what is returned.
+                gaps_overlaps = _detect_gaps_overlaps_from_snapshot(
+                    snapshot, {"track_types": track_types})
+                if "timeline" in include:
+                    snapshot.pop("markers", None)
+                    try:
+                        snapshot["fps"] = float(tl.GetSetting("timelineFrameRate"))
+                    except Exception:
+                        snapshot["fps"] = None
+                    remaining = item_limit
+                    for type_payload in snapshot["tracks"].values():
+                        for track in type_payload["tracks"]:
+                            kept = track["items"][:remaining]
+                            remaining -= len(kept)
+                            track["items"] = [
+                                {field: item.get(field) for field in _SNAPSHOT_ITEM_FIELDS}
+                                for item in kept
+                            ]
+                    snapshot["items_returned"] = item_limit - remaining
+                    snapshot["items_truncated"] = snapshot["items_returned"] < snapshot["item_count"]
+                    out["timeline"] = snapshot
+                if "gaps_overlaps" in include:
+                    out["gaps_overlaps"] = gaps_overlaps
+        except Exception as exc:
+            for name in wanted:
+                out.setdefault(name, {"error": str(exc)})
+
+    if "render" in include:
+        try:
+            jobs = []
+            for job in (proj.GetRenderJobList() or []):
+                row = _ser(job)
+                if isinstance(row, dict) and row.get("JobId"):
+                    row["status"] = _ser(proj.GetRenderJobStatus(row["JobId"]))
+                jobs.append(row)
+            out["render"] = {"is_rendering": bool(proj.IsRenderingInProgress()), "jobs": jobs}
+        except Exception as exc:
+            out["render"] = {"error": str(exc)}
+
+    if "media_pool" in include:
+        try:
+            out["media_pool"] = _project_summary(proj)["media_pool"]
+        except Exception as exc:
+            out["media_pool"] = {"error": str(exc)}
+
+    return out
+
+
 @mcp.tool()
 @_guard_missing_params
 @_destructive_op("project_manager")
@@ -19135,6 +19335,19 @@ def project_manager(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         — Resolve 21.0.4+. Per-project attributes for the current folder without
           loading any project.
       get_current() -> {name, id}
+      snapshot(include?, track_types?, item_limit?) -> {project, timeline, gaps_overlaps, render, media_pool}
+        One read-only readout of what an agent inspects before planning; it never
+        switches page, timeline or folder. include picks sections (default all);
+        item_limit caps the items returned across tracks (default 200) and sets
+        timeline.items_truncated, while item_count and gaps_overlaps still cover
+        the whole timeline. item_limit bounds the response, not the read: the
+        timeline sections cost what probe_timeline_structure costs (they scale
+        with item_count) and media_pool walks every pool clip, so on a large
+        project leave out the sections you do not need. A section that fails
+        reports {error} in its own place; an empty include is refused. Frame
+        fields are probe_timeline_structure's, unchanged: start/end
+        are TimelineItem GetStart/GetEnd record frames; source_start/source_end
+        are file-relative frames at source_fps, source_end exclusive.
       create(name, media_location_path?) -> {success, name}
       load(name) -> {success}
       save() -> {success}
@@ -19227,6 +19440,11 @@ def project_manager(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
     elif action == "get_current":
         proj = pm.GetCurrentProject()
         return {"name": proj.GetName(), "id": proj.GetUniqueId()} if proj else _err("No project open")
+    elif action == "snapshot":
+        proj = pm.GetCurrentProject()
+        if not proj:
+            return _err("No project open")
+        return _project_state_snapshot(r, proj, p)
     elif action == "create":
         if not p.get("name"):
             return _err("create requires name")
@@ -19256,7 +19474,7 @@ def project_manager(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         except Exception:
             rendering = False
         if rendering:
-            if not p.get("stop_render"):
+            if not _coerce_bool(p.get("stop_render")):
                 return _err(
                     "A render is in progress on this project. Closing now would "
                     "orphan the render and wedge Resolve's render pipeline — the "
@@ -19286,7 +19504,7 @@ def project_manager(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
             _open_name = _open.GetName() if _open else None
         except Exception:
             _open_name = None
-        if _open_name == p["name"] and not p.get("close_current", False):
+        if _open_name == p["name"] and not _coerce_bool(p.get("close_current")):
             return _err("Refusing to delete the currently open project; pass close_current=True")
         from src.utils.project_cleanup import delete_project_safely
         deleted = delete_project_safely(pm, p["name"])
@@ -19302,7 +19520,7 @@ def project_manager(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         })
         if err:
             return _err(err)
-        return {"success": bool(pm.ExportProject(p["name"], p["path"], p.get("with_stills_and_luts", True)))}
+        return {"success": bool(pm.ExportProject(p["name"], p["path"], _coerce_bool(p.get("with_stills_and_luts"), True)))}
     elif action == "archive":
         err, _clean = _validate_params(p, {
             "name": {"type": str, "required": True, "non_empty": True},
@@ -19310,13 +19528,23 @@ def project_manager(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         })
         if err:
             return _err(err)
-        return {"success": bool(pm.ArchiveProject(p["name"], p["path"],
-            p.get("src_media", True), p.get("render_cache", True), p.get("proxy_media", False)))}
+        # Every flag defaults OFF. The native defaults turn source media on, and on
+        # 21.1.0.14 that crashes Resolve (see utils/archive_guard.py).
+        flags, flag_err = archive_guard.read_flags(p)
+        if flag_err:
+            return _err(flag_err, code="INVALID_ARCHIVE_FLAG", category="invalid_input")
+        if not _coerce_bool(p.get("acknowledge_trap")):
+            refused = archive_guard.crash_refusal("project_manager", "archive", flags)
+            if refused:
+                return refused
+        native = pm.ArchiveProject(p["name"], p["path"], flags["src_media"],
+                                   flags["render_cache"], flags["proxy_media"])
+        return archive_guard.outcome(native, flags, name=p["name"], path=p["path"])
     elif action == "restore":
         if not p.get("path"):
             return _err("restore requires path")
         return {"success": bool(pm.RestoreProject(p["path"], p.get("name")))}
-    return _unknown(action, ["list","list_attributes","get_current","create","load","save","close","delete","import_project","export_project","archive","restore","lint","diff_to_spec","plan_spec","apply_spec", *_PROJECT_KERNEL_ACTIONS])
+    return _unknown(action, ["list","list_attributes","get_current","snapshot","create","load","save","close","delete","import_project","export_project","archive","restore","lint","diff_to_spec","plan_spec","apply_spec", *_PROJECT_KERNEL_ACTIONS])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -19560,7 +19788,7 @@ def project_settings(action: str, params: Optional[Dict[str, Any]] = None) -> Di
     elif action == "project_summary":
         return _project_summary(
             proj,
-            include_clips=bool(p.get("include_clips")),
+            include_clips=_coerce_bool(p.get("include_clips")),
             clip_limit=int(p.get("clip_limit", 50)),
         )
     elif action == "load_burnin_preset":
@@ -19987,7 +20215,7 @@ def _validate_render_settings_payload(settings: Dict[str, Any], *, require_temp_
 def _validate_render_settings_action(p: Dict[str, Any]):
     validation, err = _validate_render_settings_payload(
         p.get("settings"),
-        require_temp_target=bool(p.get("require_temp_target", False)),
+        require_temp_target=_coerce_bool(p.get("require_temp_target"), False),
     )
     if err:
         return err
@@ -20011,13 +20239,13 @@ def _safe_set_render_settings(proj, p: Dict[str, Any]):
     settings = p.get("settings")
     validation, err = _validate_render_settings_payload(
         settings,
-        require_temp_target=bool(p.get("require_temp_target", False)),
+        require_temp_target=_coerce_bool(p.get("require_temp_target"), False),
     )
     if err:
         return err
     if not validation["valid"]:
         return {"success": False, "validation": validation}
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(validation=validation)
     before = _render_settings_snapshot(proj)
     success = bool(proj.SetRenderSettings(settings))
@@ -20029,7 +20257,7 @@ def _safe_set_render_settings(proj, p: Dict[str, Any]):
         "after": after_settings,
         "diff": _settings_diff(settings, after_settings),
     }
-    if p.get("restore") and isinstance(before.get("settings"), dict):
+    if _coerce_bool(p.get("restore")) and isinstance(before.get("settings"), dict):
         result["restore_success"] = bool(proj.SetRenderSettings(before["settings"]))
     return result
 
@@ -20040,18 +20268,18 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
         return _err("target_dir or settings.TargetDir is required")
     if not os.path.isdir(target_dir):
         return _err(f"target_dir does not exist: {target_dir}")
-    if p.get("require_temp_target", True) and not _render_temp_path_ok(target_dir):
+    if _coerce_bool(p.get("require_temp_target"), True) and not _render_temp_path_ok(target_dir):
         return _err("target_dir must be under the system temp directory unless require_temp_target=False")
     settings = dict(p.get("settings") or {})
     settings.setdefault("TargetDir", target_dir)
     if p.get("custom_name"):
         settings["CustomName"] = p["custom_name"]
-    validation, err = _validate_render_settings_payload(settings, require_temp_target=p.get("require_temp_target", True))
+    validation, err = _validate_render_settings_payload(settings, require_temp_target=_coerce_bool(p.get("require_temp_target"), True))
     if err:
         return err
     if not validation["valid"]:
         return {"success": False, "validation": validation}
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(validation=validation, format=p.get("format"), codec=p.get("codec"))
     before = _render_settings_snapshot(proj)
     # Pin the base render state before layering explicit settings on top. Without
@@ -20289,7 +20517,7 @@ def _list_delivery_targets(proj, p: Dict[str, Any]):
     extras = _delivery_target_extras()
     listing = _delivery_targets.list_targets(extras, tier=tier)
 
-    if p.get("check_availability"):
+    if _coerce_bool(p.get("check_availability")):
         # Resolve every target against the live matrix so the caller sees what
         # this machine/license can actually render, not just what ships.
         formats = _render_formats(proj)
@@ -20316,7 +20544,7 @@ def _list_delivery_targets(proj, p: Dict[str, Any]):
         targets=listing,
         schema_version=_delivery_targets.SCHEMA_VERSION,
         tiers=list(_delivery_targets.TIERS),
-        availability_checked=bool(p.get("check_availability")),
+        availability_checked=_coerce_bool(p.get("check_availability")),
     )
 
 
@@ -20391,13 +20619,13 @@ def _safe_quick_export(proj, p: Dict[str, Any]):
     params["EnableUpload"] = False
     validation, err = _validate_render_settings_payload(
         {key: value for key, value in params.items() if key in _RENDER_SETTING_KEYS},
-        require_temp_target=bool(p.get("require_temp_target", True)),
+        require_temp_target=_coerce_bool(p.get("require_temp_target"), True),
     )
     if err:
         return err
     if not validation["valid"]:
         return {"success": False, "validation": validation}
-    if p.get("dry_run") or not p.get("allow_render", False):
+    if _coerce_bool(p.get("dry_run")) or not _coerce_bool(p.get("allow_render")):
         return _ok(would_render=False, preset=preset, params=params, validation=validation)
     before = set()
     if target_dir and os.path.isdir(target_dir):
@@ -20440,9 +20668,9 @@ def _export_render_boundary_report(proj, p: Dict[str, Any]):
         "capabilities": _render_capabilities(proj),
         "settings": _render_settings_snapshot(proj),
     }
-    if p.get("include_matrix", True):
+    if _coerce_bool(p.get("include_matrix"), True):
         report["matrix"] = _probe_render_matrix(proj, {"max_pairs": p.get("max_pairs")})
-    if p.get("include_quick_export", True):
+    if _coerce_bool(p.get("include_quick_export"), True):
         report["quick_export"] = _quick_export_capabilities(proj)
     return report
 
@@ -20718,7 +20946,7 @@ def render(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
         return result
     elif action == "start":
         job_ids = p.get("job_ids")
-        interactive = p.get("interactive", False)
+        interactive = _coerce_bool(p.get("interactive"), False)
         if job_ids:
             return {"success": bool(proj.StartRendering(job_ids, interactive))}
         return {"success": bool(proj.StartRendering(interactive))}
@@ -20949,7 +21177,10 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
       add_subfolder(name, parent_path?) -> {success, name, id}
       delete_folders(folder_ids) -> {success}
         DESTRUCTIVE. Deletes folders + every clip they contain.
+        folder_ids resolve at ANY depth; an id matching nothing fails the whole
+        call (FOLDER_NOT_FOUND) rather than deleting the ids that did resolve.
       move_folders(folder_ids, target_path) -> {success}
+        folder_ids resolve at ANY depth; unresolved ids fail the whole call.
       refresh() -> {success}
       create_timeline(name, if_exists?) -> {success, name, id}
         — if_exists: version (default), reuse, or fail
@@ -20976,6 +21207,9 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
           record_frame is relative to the current timeline start frame by default;
           pass record_frame_mode="absolute" for raw Resolve recordFrame values.
           Returns timeline_item_id per item.
+        Either form: Resolve answering None/False/[] is APPEND_TO_TIMELINE_FAILED,
+          with verified_operation (the timeline readback) kept on the error;
+          retryable only when the readback shows nothing was appended.
       import_media(paths) -> {imported}
         UNSAFE. No dry_run. Prefer safe_import_media.
         — simple: params.paths is a list of file/folder paths
@@ -20986,12 +21220,17 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
           Example: [{"FilePath": "frame_%03d.dpx", "StartIndex": 1, "EndIndex": 100}]
       delete_clips(clip_ids) -> {success}
         DESTRUCTIVE. Removes clips from the Media Pool (does not touch source files).
+        An id matching no clip fails the whole call (CLIP_NOT_FOUND) rather than
+        deleting the ids that did resolve; the same holds for every clip_ids
+        batch in this tool (move_clips, relink, unlink, create_timeline_from_clips,
+        append_to_timeline, export_metadata, auto_sync_audio).
       move_clips(clip_ids, target_path) -> {success}
       relink(clip_ids, folder_path) -> {success}
         UNSAFE. No dry_run. Prefer safe_relink.
       unlink(clip_ids) -> {success}
         UNSAFE. No dry_run. Prefer safe_unlink.
       export_metadata(path, clip_ids?) -> {success}
+        — clip_ids omitted exports every clip; an empty clip_ids is INVALID_CLIP_IDS.
       get_unique_id() -> {id}
       create_stereo_clip(left_id, right_id) -> {success, name}
       auto_sync_audio(clip_ids, settings?) -> {success}
@@ -21054,14 +21293,9 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
         f = mp.AddSubFolder(parent, p["name"])
         return _ok(name=f.GetName(), id=f.GetUniqueId()) if f else _err("Failed to create subfolder")
     elif action == "delete_folders":
-        folders = []
-        for fid in p["folder_ids"]:
-            # Search for folder by ID (simplified - searches root subfolders)
-            for sub in (root.GetSubFolderList() or []):
-                if sub.GetUniqueId() == fid:
-                    folders.append(sub)
-        if not folders:
-            return _err("No folders found")
+        folders, folders_err = _folders_from_ids(root, p["folder_ids"], verb="deleted")
+        if folders_err:
+            return folders_err
         if "confirm_token" not in p and "confirmToken" not in p and _confirm_token_required():
             return _issue_confirm_token(
                 action="media_pool.delete_folders", params=p,
@@ -21077,12 +21311,12 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
     elif action == "move_folders":
         target = _navigate_folder(mp, p["target_path"])
         if not target:
-            return _err(f"Target folder not found: {p['target_path']}")
-        folders = []
-        for fid in p["folder_ids"]:
-            for sub in (root.GetSubFolderList() or []):
-                if sub.GetUniqueId() == fid:
-                    folders.append(sub)
+            return _err(f"Target folder not found: {p['target_path']}",
+                        code="FOLDER_NOT_FOUND", category="invalid_input",
+                        remediation=_FOLDER_ID_REMEDIATION)
+        folders, folders_err = _folders_from_ids(root, p["folder_ids"], verb="moved")
+        if folders_err:
+            return folders_err
         return {"success": bool(mp.MoveFolders(folders, target))}
     elif action == "refresh":
         return {"success": bool(mp.RefreshFolders())}
@@ -21141,10 +21375,9 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
         clip_ids = p.get("clip_ids")
         if not clip_ids:
             return _err("Provide clip_ids (simple) or clip_infos (positioned)")
-        clips = [_find_clip(root, cid) for cid in clip_ids]
-        clips = [c for c in clips if c]
-        if not clips:
-            return _err("No valid clips found")
+        clips, clips_err = _clips_from_ids(root, clip_ids, verb="created")
+        if clips_err:
+            return clips_err
         tl = mp.CreateTimelineFromClips(create_name, clips)
         return _ok(
             name=tl.GetName(),
@@ -21236,7 +21469,8 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
                 len(built),
             )
             if not result:
-                return _err("Failed to append clip_infos to timeline")
+                return _append_to_timeline_failed(
+                    "Failed to append clip_infos to timeline", result, requested, verification, before)
             items_out = []
             for i, item in enumerate(result):
                 item_out, item_err = _serialize_appended_timeline_item(item, i)
@@ -21253,8 +21487,11 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
         clip_ids = p.get("clip_ids")
         if not clip_ids:
             return _err("Provide clip_ids (simple append) or clip_infos (positioned append)")
-        clips = [_find_clip(root, cid) for cid in clip_ids]
-        clips = [c for c in clips if c]
+        # All or nothing: expected_count below used to be the RESOLVED count, so a
+        # partial append read back as verified.
+        clips, clips_err = _clips_from_ids(root, clip_ids, verb="appended")
+        if clips_err:
+            return clips_err
         requested = {
             "mode": "clip_ids",
             "clip_ids": list(clip_ids),
@@ -21268,7 +21505,10 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
             requested,
             len(clips),
         )
-        out = _ok(count=len(result) if result else 0)
+        if not result:
+            return _append_to_timeline_failed(
+                "Failed to append clip_ids to timeline", result, requested, verification, before)
+        out = _ok(count=len(result))
         out["verified_operation"] = _append_to_timeline_verified_operation(
             requested,
             verification,
@@ -21293,10 +21533,9 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
             result = mp.ImportMedia(paths)
         return {"imported": len(result) if result else 0}
     elif action == "delete_clips":
-        clips = [_find_clip(root, cid) for cid in p["clip_ids"]]
-        clips = [c for c in clips if c]
-        if not clips:
-            return _err("No clips found")
+        clips, clips_err = _clips_from_ids(root, p["clip_ids"], verb="deleted")
+        if clips_err:
+            return clips_err
         if "confirm_token" not in p and "confirmToken" not in p and _confirm_token_required():
             return _issue_confirm_token(
                 action="media_pool.delete_clips", params=p,
@@ -21313,24 +21552,31 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
         target = _navigate_folder(mp, p["target_path"])
         if not target:
             return _err(f"Target folder not found: {p['target_path']}")
-        clips = [_find_clip(root, cid) for cid in p["clip_ids"]]
-        clips = [c for c in clips if c]
+        clips, clips_err = _clips_from_ids(root, p["clip_ids"], verb="moved")
+        if clips_err:
+            return clips_err
         return {"success": bool(mp.MoveClips(clips, target))}
     elif action == "relink":
-        clips = [_find_clip(root, cid) for cid in p["clip_ids"]]
-        clips = [c for c in clips if c]
+        clips, clips_err = _clips_from_ids(root, p["clip_ids"], verb="relinked")
+        if clips_err:
+            return clips_err
         return {"success": bool(mp.RelinkClips(clips, p["folder_path"]))}
     elif action == "unlink":
-        clips = [_find_clip(root, cid) for cid in p["clip_ids"]]
-        clips = [c for c in clips if c]
+        clips, clips_err = _clips_from_ids(root, p["clip_ids"], verb="unlinked")
+        if clips_err:
+            return clips_err
         return {"success": bool(mp.UnlinkClips(clips))}
     elif action == "export_metadata":
-        clip_ids = p.get("clip_ids")
-        if clip_ids:
-            clips = [_find_clip(root, cid) for cid in clip_ids]
-            clips = [c for c in clips if c]
-            return {"success": bool(mp.ExportMetadata(p["path"], clips))}
-        return {"success": bool(mp.ExportMetadata(p["path"]))}
+        path = p["path"]
+        if p.get("clip_ids") is None:
+            return {"success": bool(mp.ExportMetadata(path))}
+        # Passing clip_ids at all asks for exactly those clips. An empty or
+        # all-missing list must not reach ExportMetadata(path, []), whose
+        # behaviour on an empty list is unmeasured and may be "export everything".
+        clips, clips_err = _clips_from_ids(root, p["clip_ids"], verb="exported")
+        if clips_err:
+            return clips_err
+        return {"success": bool(mp.ExportMetadata(path, clips))}
     elif action == "get_unique_id":
         return {"id": mp.GetUniqueId()}
     elif action == "create_stereo_clip":
@@ -21341,8 +21587,9 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
         result = mp.CreateStereoClip(left, right)
         return _ok(name=result.GetName()) if result else _err("Failed to create stereo clip")
     elif action == "auto_sync_audio":
-        clips = [_find_clip(root, cid) for cid in p["clip_ids"]]
-        clips = [c for c in clips if c]
+        clips, clips_err = _clips_from_ids(root, p["clip_ids"], verb="synced")
+        if clips_err:
+            return clips_err
         # Normalize string settings into live AUDIO_SYNC_* enum keys; passing raw
         # human-readable keys makes AutoSyncAudio silently reject the call.
         settings, ignored = _normalize_auto_sync_settings(dict(p.get("settings") or {}), get_resolve())
@@ -21700,7 +21947,7 @@ def media_pool_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         # when the clip loads in source viewer. Caller passes seconds; we convert
         # to frames using the clip's fps from properties.
         mark_set: Optional[Dict[str, Any]] = None
-        if p.get("clear_marks") or p.get("clearMarks"):
+        if _coerce_bool(p.get("clear_marks")) or _coerce_bool(p.get("clearMarks")):
             try:
                 clip.ClearMarkInOut(p.get("mark_type") or "all")
                 mark_set = {"cleared": True}
@@ -21761,7 +22008,7 @@ def media_pool_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
 
         # Bring Resolve to the foreground so the editor doesn't have to
         # alt-tab. Default on; pass focus_app=false to suppress.
-        focus_app = p.get("focus_app", p.get("focusApp", True))
+        focus_app = _coerce_bool(p.get("focus_app", p.get("focusApp")), True)
         focus_result: Optional[Dict[str, Any]] = None
         if focus_app:
             focus_result = _activate_resolve_window()
@@ -21771,7 +22018,7 @@ def media_pool_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         # call, so we send the keyboard equivalent of "Go to In" once the
         # app is in the foreground. Default on when a mark was set.
         jump_result: Optional[Dict[str, Any]] = None
-        wants_jump = p.get("jump_to_mark_in", p.get("jumpToMarkIn", True))
+        wants_jump = _coerce_bool(p.get("jump_to_mark_in", p.get("jumpToMarkIn")), True)
         applied_mark = bool(mark_set and mark_set.get("applied"))
         if wants_jump and applied_mark and focus_result and focus_result.get("activated"):
             jump_result = _send_resolve_keystroke_go_to_mark_in()
@@ -21921,12 +22168,12 @@ def media_pool_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         # Segment timecodes are SOURCE timecodes, not timeline positions.
         if _has_method(clip, "GetTranscription"):
             try:
-                full = clip.GetTranscription(bool(p.get("use_nested_clip_transcription", False)))
+                full = clip.GetTranscription(_coerce_bool(p.get("use_nested_clip_transcription"), False))
             except Exception:
                 full = None
             segs = full.get("segments") if isinstance(full, dict) else None
             if segs:
-                if not p.get("include_words"):
+                if not _coerce_bool(p.get("include_words")):
                     # `words` is several times the bulk of the segment text and
                     # most callers want segment-level timing. Opt in for it.
                     segs = [{k: v for k, v in seg.items() if k != "words"}
@@ -22426,7 +22673,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
         try:
             # Dry run by default: the ladder can spend a dozen ffmpeg decodes per clip,
             # and the plan names that budget before anyone commits to it.
-            if p.get("dry_run", True):
+            if _coerce_bool(p.get("dry_run"), True):
                 return _ok(**_grade_loop_mod.plan(source, lut, **kwargs))
             return _ok(**_grade_loop_mod.run(
                 source, lut,
@@ -22478,7 +22725,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
                 release_s=float(p.get("release_s", _mix_plan_mod.DEFAULT_RELEASE_S)),
                 hold_s=float(p.get("hold_s", _mix_plan_mod.DEFAULT_HOLD_S)),
             )
-            if p.get("dry_run", True):
+            if _coerce_bool(p.get("dry_run"), True):
                 return _ok(**_mix_plan_mod.plan(dialogue, **kwargs))
             return _ok(**_mix_plan_mod.render(
                 dialogue,
@@ -22553,7 +22800,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
             if vctx is None:
                 return _err("No project context — open a Resolve project first")
             _r, _proj, project_root, _name = vctx
-            session_only = bool(p.get("session_only", False))
+            session_only = _coerce_bool(p.get("session_only"), False)
             session_id = _AI_LEDGER_SESSION_ID if session_only else None
             limit = _safe_int(p.get("limit"), 50, minimum=1, maximum=1000)
             return {
@@ -22667,7 +22914,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
             project_id=project_id,
             analysis_root=p.get("analysis_root"),
             source_paths=p.get("source_paths") or p.get("sourcePaths") or [],
-            create=bool(p.get("create", False)),
+            create=_coerce_bool(p.get("create"), False),
         )
 
     if action in {
@@ -22732,7 +22979,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
             project_id=project_id,
             analysis_root=p.get("analysis_root"),
             source_paths=[],
-            create=bool(p.get("create", False)),
+            create=_coerce_bool(p.get("create"), False),
         )
         if not root.get("success"):
             return root
@@ -22845,7 +23092,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
                 end_seconds=end,
                 match_word=p.get("match_word") or p.get("matchWord") or p.get("word"),
                 context_seconds=_opt_number(p.get("context_seconds", p.get("contextSeconds"))) or 2.0,
-                include_curve_values=bool(p.get("include_curve_values", p.get("includeCurveValues", False))),
+                include_curve_values=_coerce_bool(p.get("include_curve_values", p.get("includeCurveValues")), False),
                 limit=int(_opt_number(p.get("limit")) or 20),
             )
         if action == "timeline_strata":
@@ -22870,7 +23117,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
                 record_start_frame=int(start_frame) if start_frame is not None else None,
                 record_end_frame=int(end_frame) if end_frame is not None else None,
                 fps=fps,
-                include_curve_values=bool(p.get("include_curve_values", p.get("includeCurveValues", False))),
+                include_curve_values=_coerce_bool(p.get("include_curve_values", p.get("includeCurveValues")), False),
             )
         if action == "plan_story_beats":
             from src.utils import strata_story
@@ -23073,7 +23320,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
             if not job_id:
                 return _err("resume_batch_job requires job_id")
             return resume_media_analysis_batch_job(project_root, str(job_id))
-        return cleanup_media_analysis_artifacts(project_root, frames_only=bool(p.get("frames_only", True)))
+        return cleanup_media_analysis_artifacts(project_root, frames_only=_coerce_bool(p.get("frames_only"), True))
 
     if action == "review_timeline_markers":
         tl = proj.GetCurrentTimeline()
@@ -23268,11 +23515,11 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
         if action == "analyze_file":
             target.update({"type": "file", "path": p.get("path") or p.get("file_path") or p.get("filePath") or target.get("path")})
         elif action == "analyze_clip":
-            target.update({"type": "clip", "clip_id": p.get("clip_id") or target.get("clip_id"), "selected": p.get("selected", target.get("selected", False))})
+            target.update({"type": "clip", "clip_id": p.get("clip_id") or target.get("clip_id"), "selected": _coerce_bool(p.get("selected", target.get("selected")), False)})
         elif action == "analyze_bin":
-            target.update({"type": "bin", "path": p.get("bin_path") or p.get("path") or target.get("path") or "Master", "recursive": p.get("recursive", target.get("recursive", True))})
+            target.update({"type": "bin", "path": p.get("bin_path") or p.get("path") or target.get("path") or "Master", "recursive": _coerce_bool(p.get("recursive", target.get("recursive")), True)})
         elif action == "analyze_project":
-            target.update({"type": "project", "recursive": p.get("recursive", target.get("recursive", True))})
+            target.update({"type": "project", "recursive": _coerce_bool(p.get("recursive", target.get("recursive")), True)})
         elif action in {"analyze_timeline", "analyze_sequence"}:
             target.update({
                 "type": "sequence",
@@ -23370,11 +23617,11 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
             plan["warnings"] = warnings
         if (
             plan.get("capability_gaps")
-            and not bool(p.get("dry_run", True))
+            and not _coerce_bool(p.get("dry_run"), True)
             and media_analysis_plan_requires_capabilities(plan)
         ):
             return _e2_wrap(_media_analysis_missing_capabilities_response(plan))
-        if not bool(p.get("dry_run", True)):
+        if not _coerce_bool(p.get("dry_run"), True):
             executed = await execute_media_analysis_plan_async(
                 plan,
                 params=p,
@@ -23801,7 +24048,7 @@ def _attach_audit_report(result: Dict[str, Any], params: Dict[str, Any]) -> Dict
     if not isinstance(result, dict) or not result.get("success"):
         return result
     result["report_available"] = "pass include_report=true for a Markdown report"
-    flag = params.get("include_report", params.get("includeReport", False))
+    flag = _coerce_bool(params.get("include_report", params.get("includeReport")), False)
     if str(flag).strip().lower() in {"true", "1", "yes", "on"}:
         try:
             result["report_markdown"] = _edit_report_mod.render_any(result)
@@ -24155,7 +24402,7 @@ def edit_engine(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
             target_ratio=p.get("target_ratio") or p.get("targetRatio"),
             min_pause_seconds=float(p.get("min_pause_seconds") or p.get("minPauseSeconds") or _edit_engine_mod.DEFAULT_MIN_PAUSE_SECONDS),
             handle_seconds=float(p.get("handle_seconds") or p.get("handleSeconds") or _edit_engine_mod.DEFAULT_HANDLE_SECONDS),
-            include_audio=str(p.get("include_audio", p.get("includeAudio", True))).strip().lower() not in {"false", "0", "no", "none", "off"},
+            include_audio=str(_coerce_bool(p.get("include_audio", p.get("includeAudio")), True)).strip().lower() not in {"false", "0", "no", "none", "off"},
         )
 
     if action == "generate_captions":
@@ -24184,7 +24431,7 @@ def edit_engine(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
             _result = _captions_mod.generate(
                 _words,
                 fmt=str(p.get("format") or p.get("fmt") or "srt").lower(),
-                with_chapters=str(p.get("with_chapters", p.get("withChapters", False))).strip().lower() in {"true", "1", "yes", "on"},
+                with_chapters=str(_coerce_bool(p.get("with_chapters", p.get("withChapters")), False)).strip().lower() in {"true", "1", "yes", "on"},
                 **_opts,
             )
         except _captions_mod.CaptionError as exc:
@@ -24199,9 +24446,9 @@ def edit_engine(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         return _edit_engine_mod.plan_transcript_tighten(
             project_root,
             clip_ref=p.get("clip_ref") or p.get("clipRef") or p.get("clip_id"),
-            remove_fillers=str(p.get("remove_fillers", p.get("removeFillers", True))).strip().lower() not in {"false", "0", "no", "off"},
-            remove_false_starts=str(p.get("remove_false_starts", p.get("removeFalseStarts", True))).strip().lower() not in {"false", "0", "no", "off"},
-            collapse_pauses=str(p.get("collapse_pauses", p.get("collapsePauses", True))).strip().lower() not in {"false", "0", "no", "off"},
+            remove_fillers=str(_coerce_bool(p.get("remove_fillers", p.get("removeFillers")), True)).strip().lower() not in {"false", "0", "no", "off"},
+            remove_false_starts=str(_coerce_bool(p.get("remove_false_starts", p.get("removeFalseStarts")), True)).strip().lower() not in {"false", "0", "no", "off"},
+            collapse_pauses=str(_coerce_bool(p.get("collapse_pauses", p.get("collapsePauses")), True)).strip().lower() not in {"false", "0", "no", "off"},
             max_pause=float(p.get("max_pause", p.get("maxPause", _transcript_edit_defaults.DEFAULT_MAX_PAUSE_S))),
             handle=float(p.get("handle", _transcript_edit_defaults.DEFAULT_HANDLE_S)),
             min_cut=float(p.get("min_cut", p.get("minCut", _transcript_edit_defaults.DEFAULT_MIN_CUT_S))),
@@ -24263,7 +24510,7 @@ def edit_engine(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
             min_strip_frames=float(p.get("min_strip_frames") if p.get("min_strip_frames") is not None else p.get("minStripFrames") if p.get("minStripFrames") is not None else _edit_engine_mod.DEFAULT_SILENCE_MIN_STRIP_FRAMES),
             pre_head_frames=float(p.get("pre_head_frames") if p.get("pre_head_frames") is not None else p.get("preHeadFrames") if p.get("preHeadFrames") is not None else _edit_engine_mod.DEFAULT_SILENCE_PRE_HEAD_FRAMES),
             post_tail_frames=float(p.get("post_tail_frames") if p.get("post_tail_frames") is not None else p.get("postTailFrames") if p.get("postTailFrames") is not None else _edit_engine_mod.DEFAULT_SILENCE_POST_TAIL_FRAMES),
-            include_audio=str(p.get("include_audio", p.get("includeAudio", True))).strip().lower() not in {"false", "0", "no", "none", "off"},
+            include_audio=str(_coerce_bool(p.get("include_audio", p.get("includeAudio")), True)).strip().lower() not in {"false", "0", "no", "none", "off"},
         )
 
     if action == "rule_of_six_audit":
@@ -24498,7 +24745,7 @@ def edit_engine(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
                         code="MISSING_CANDIDATES", category="invalid_input")
         return _edit_engine_mod.plan_broll(
             beats=beats, candidates=candidates,
-            allow_reuse=str(p.get("allow_reuse", p.get("allowReuse", False))).strip().lower() in {"true", "1", "yes", "on"},
+            allow_reuse=str(_coerce_bool(p.get("allow_reuse", p.get("allowReuse")), False)).strip().lower() in {"true", "1", "yes", "on"},
         )
 
     if action == "plan_turnover":
@@ -25662,7 +25909,7 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
                     if it.GetUniqueId() in ids_set:
                         found.append(it)
         # B2 — ripple=True is catastrophic; require confirmation.
-        ripple = bool(p.get("ripple", False))
+        ripple = _coerce_bool(p.get("ripple"))
         if ripple:
             if "confirm_token" not in p and "confirmToken" not in p and _confirm_token_required():
                 return _issue_confirm_token(
@@ -25839,7 +26086,7 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         mpi = tl.GetMediaPoolItem()
         return {"name": mpi.GetName(), "id": mpi.GetUniqueId()} if mpi else {"name": None, "id": None}
     elif action == "get_transcript":
-        return _timeline_transcript(tl, with_timecodes=bool(p.get("with_timecodes")))
+        return _timeline_transcript(tl, with_timecodes=_coerce_bool(p.get("with_timecodes")))
     elif action == "propose_cuts":
         # Dry-run only: detect mechanical cuts (fillers, long pauses, repeats)
         # from the timeline's subtitle transcript. Proposes; never edits.
@@ -25866,7 +26113,7 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         applicable.sort(key=lambda c: c["span"]["start"], reverse=True)
         plan = [{"action": c["action"], "span": c["span"], "kind": c.get("kind")} for c in applicable]
 
-        if p.get("dry_run", True):
+        if _coerce_bool(p.get("dry_run"), True):
             return {
                 "dry_run": True,
                 "would_apply": len(applicable),
@@ -25892,7 +26139,7 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         if blocked:
             return blocked
 
-        allow_partial = bool(p.get("allow_partial_item_delete", True))
+        allow_partial = _coerce_bool(p.get("allow_partial_item_delete"), True)
         results = []
         resolve_obj = get_resolve()
         # Hold the Edit page once for the whole run. The per-delete guard nests
@@ -26446,6 +26693,7 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
       set_fades(options, ...) -> {success} — native 21.1 FadeIn/FadeOut integer frames.
       get_speed(...) -> {speed} — documented on Resolve 21.1+.
       get_fades(...) -> {fades} — documented on Resolve 21.1+. Native frame durations.
+      get_type(...) -> {type} — native lowercase TimelineItem type documented on Resolve 21.1+.
       get_output_blanking(...) -> {blanking} — documented on Resolve 21.1+. Pixel coordinates; empty on a clip inheriting timeline blanking.
       get_use_timeline_for_output_blanking(...) -> {use_timeline} — documented on Resolve 21.1+.
       get_name(track_type?, track_index?, item_index?) -> {name}
@@ -26559,6 +26807,11 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
         if missing:
             return missing
         return {"fades": _ser(item.GetFades())}
+    if action == "get_type":
+        missing = _requires_method(item, "GetType", "21.1")
+        if missing:
+            return missing
+        return {"type": _ser(item.GetType())}
     if action == "get_output_blanking":
         missing = _requires_method(item, "GetOutputBlanking", "21.1")
         if missing:
@@ -26745,7 +26998,7 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
             return _err(f"Invalid interpolation. Must be one of: {', '.join(valid)}")
         return {"success": bool(item.SetKeyframeInterpolation(p["property"], p["frame"], p["interpolation"]))}
 
-    return _unknown(action, ["set_output_blanking","set_use_timeline_for_output_blanking","flatten_multicam","add_transition","set_speed","set_fades","get_speed","get_fades","get_output_blanking","get_use_timeline_for_output_blanking","get_name","get_property","set_property","get_duration","get_start","get_end","get_source_start_frame","get_source_end_frame","get_source_start_time","get_source_end_time","get_left_offset","get_right_offset","set_clip_enabled","get_clip_enabled","update_sidecar","get_unique_id","get_media_pool_item","get_stereo_convergence","get_stereo_left_window","get_stereo_right_window","get_linked_items","get_track_type_and_index","get_source_audio_mapping","load_burnin_preset","set_name","get_voice_isolation_state","set_voice_isolation_state","get_retime","set_retime","get_transform","set_transform","get_crop","set_crop","get_composite","set_composite","get_audio","set_audio","get_keyframes","add_keyframe","modify_keyframe","delete_keyframe","set_keyframe_interpolation"])
+    return _unknown(action, ["set_output_blanking","set_use_timeline_for_output_blanking","flatten_multicam","add_transition","set_speed","set_fades","get_speed","get_fades","get_type","get_output_blanking","get_use_timeline_for_output_blanking","get_name","get_property","set_property","get_duration","get_start","get_end","get_source_start_frame","get_source_end_frame","get_source_start_time","get_source_end_time","get_left_offset","get_right_offset","set_clip_enabled","get_clip_enabled","update_sidecar","get_unique_id","get_media_pool_item","get_stereo_convergence","get_stereo_left_window","get_stereo_right_window","get_linked_items","get_track_type_and_index","get_source_audio_mapping","load_burnin_preset","set_name","get_voice_isolation_state","set_voice_isolation_state","get_retime","set_retime","get_transform","set_transform","get_crop","set_crop","get_composite","set_composite","get_audio","set_audio","get_keyframes","add_keyframe","modify_keyframe","delete_keyframe","set_keyframe_interpolation"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -27127,7 +27380,7 @@ def _grade_item_snapshot(item, proj=None, p: Optional[Dict[str, Any]] = None):
                 out["errors"].append({"method": method_name, "error": str(exc)})
     try:
         graph = item.GetNodeGraph(p["layer_index"]) if "layer_index" in p else item.GetNodeGraph()
-        out["node_graph"] = _graph_snapshot(graph, include_nodes=p.get("include_nodes", True), max_nodes=p.get("max_nodes", 3))
+        out["node_graph"] = _graph_snapshot(graph, include_nodes=_coerce_bool(p.get("include_nodes"), True), max_nodes=p.get("max_nodes", 3))
     except Exception as exc:
         out["node_graph"] = {"available": False, "error": str(exc)}
     try:
@@ -27180,7 +27433,7 @@ def _probe_color_node_graph(proj, item, p: Dict[str, Any]):
         return err
     snapshot = _graph_snapshot(
         graph,
-        include_nodes=p.get("include_nodes", True),
+        include_nodes=_coerce_bool(p.get("include_nodes"), True),
         max_nodes=p.get("max_nodes", 3),
     )
     snapshot["source"] = source
@@ -27250,7 +27503,7 @@ def _safe_set_cdl(item, p: Dict[str, Any]):
         return {"success": False, "validation": validation}
     normalized = _normalize_cdl(validation["cdl"])
     node_ok, preflight = _cdl_node_preflight(item, validation["cdl"]["NodeIndex"])
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(validation=validation, normalized=normalized, node_preflight=preflight)
     if not node_ok:
         return {
@@ -27296,7 +27549,7 @@ def _safe_copy_grade(item, p: Dict[str, Any]):
         return err
     targets, missing = _timeline_items_for_grade_copy(tl, target_ids)
     target_summaries = [_timeline_item_summary(target) for target in targets]
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(targets=target_summaries, missing=missing, would_copy=not missing)
     if missing:
         return {"success": False, "targets": target_summaries, "missing": missing}
@@ -27321,7 +27574,7 @@ def _safe_export_lut(item, p: Dict[str, Any]):
     path = p.get("path")
     if not path:
         return _err("path is required")
-    if p.get("require_temp_path", True) and not _grade_temp_path_ok(path):
+    if _coerce_bool(p.get("require_temp_path"), True) and not _grade_temp_path_ok(path):
         return _err("path must be under the system temp directory unless require_temp_path=False")
     folder = os.path.dirname(os.path.abspath(path))
     if folder:
@@ -27330,7 +27583,7 @@ def _safe_export_lut(item, p: Dict[str, Any]):
     export_type, type_err = _resolve_lut_export_type(p.get("type", "33ptcube"), resolve_obj)
     if type_err:
         return type_err
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(path=path, type=export_type, would_export=True)
     before_exists = os.path.exists(path)
     success = bool(item.ExportLUT(export_type, path))
@@ -27350,7 +27603,7 @@ def _safe_apply_drx(proj, item, p: Dict[str, Any]):
         return _err("path is required", code="MISSING_PATH", category="invalid_input")
     if not os.path.isfile(path):
         return _err(f"DRX file not found: {path}", code="DRX_NOT_FOUND", category="invalid_input")
-    if p.get("require_temp_path", True) and not _grade_temp_path_ok(path):
+    if _coerce_bool(p.get("require_temp_path"), True) and not _grade_temp_path_ok(path):
         return _err("DRX path must be under the system temp directory unless require_temp_path=False",
                     code="DRX_PATH_NOT_TEMP", category="invalid_input")
     graph, source, err = _color_graph_from_params(proj, item, p)
@@ -27359,7 +27612,7 @@ def _safe_apply_drx(proj, item, p: Dict[str, Any]):
     if not _has_method(graph, "ApplyGradeFromDRX"):
         return _err(f"{source} graph does not expose ApplyGradeFromDRX",
                     code="APPLY_DRX_UNSUPPORTED", category="unsupported")
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(path=path, source=source, grade_mode=p.get("grade_mode", p.get("mode", 0)), would_apply=True)
     # B2 — Whole-grade replacement is catastrophic; require confirmation.
     if "confirm_token" not in p and "confirmToken" not in p:
@@ -27449,7 +27702,7 @@ def _resolve_trace_plan(tl, plan: Dict[str, Any], p: Dict[str, Any]) -> List[Dic
     """Map each plan match onto a live clip. status: apply | skip (+reason)."""
     min_conf = float(p.get("min_confidence", 0.8))
     tol = int(p.get("start_tolerance", 0))
-    require_temp = p.get("require_temp_path", True)
+    require_temp = _coerce_bool(p.get("require_temp_path"), True)
     live = _live_video_items(tl)
     rows: List[Dict[str, Any]] = []
     for m in plan["matches"]:
@@ -27544,7 +27797,7 @@ def _apply_trace_plan(p: Dict[str, Any]) -> Dict[str, Any]:
         return err
     live_name = tl.GetName()
     plan_tl = (plan.get("target") or {}).get("timeline")
-    if plan_tl and plan_tl != live_name and not p.get("allow_timeline_mismatch"):
+    if plan_tl and plan_tl != live_name and not _coerce_bool(p.get("allow_timeline_mismatch")):
         return _err(
             f"plan targets timeline {plan_tl!r} but the current timeline is {live_name!r}",
             code="TIMELINE_MISMATCH", category="invalid_input",
@@ -27569,14 +27822,14 @@ def _apply_trace_plan(p: Dict[str, Any]) -> Dict[str, Any]:
     grade_mode = p.get("grade_mode", 0)
     version_name = p.get("version_name")
     max_rows = p.get("max_rows", _TRACE_MAX_ROWS_DEFAULT)
-    max_rows = len(public) if p.get("verbose") else max(0, int(max_rows))
+    max_rows = len(public) if _coerce_bool(p.get("verbose")) else max(0, int(max_rows))
     # Entries that deserve a human look: skipped for a reason other than the
     # two bulk ones, or applied on a tie / a partial source-range overlap.
     bulk = {"unmatched", "no-source-grade"}
     attention = [r for r in public if (r["status"] != "apply" and r["reason"] not in bulk)
                  or (r["status"] == "apply" and r["ambiguous"])]
 
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         report_path = _trace_report(p, plan, "dry-run", {"summary": summary, "resolution": public})
         return _ok(dry_run=True, timeline=live_name, plan_source=plan.get("source"),
                    summary=summary, report_path=report_path,
@@ -27693,7 +27946,7 @@ def _grade_version_restore(item, p: Dict[str, Any]):
     names = snapshot["local"] if version_type == 0 else snapshot["remote"]
     if name not in names:
         return {"success": False, "snapshot": snapshot, "error": f"Version '{name}' not found"}
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(snapshot=snapshot, would_load=name, type=version_type)
     return {"success": bool(item.LoadVersionByName(name, version_type)), "snapshot": snapshot}
 
@@ -27748,7 +28001,7 @@ def _grade_boundary_report(proj, item, p: Dict[str, Any]):
         "color_groups": _color_group_capabilities(proj),
         "gallery": _gallery_capabilities(proj),
     }
-    if p.get("include_timeline_graph", True):
+    if _coerce_bool(p.get("include_timeline_graph"), True):
         report["timeline_graph"] = _probe_color_node_graph(proj, item, {"source": "timeline", "include_nodes": False})
     return report
 
@@ -28101,7 +28354,7 @@ def _bulk_match_to_hero(proj, p: Dict[str, Any]) -> Dict[str, Any]:
             remediation="Use method='copy_grade' or call safe_set_cdl per target with hand-rolled values.",
         )
 
-    dry_run = bool(p.get("dry_run", True))
+    dry_run = _coerce_bool(p.get("dry_run"), True)
     payload: Dict[str, Any] = {
         "hero": hero_summary,
         "proposals": proposals,
@@ -28235,7 +28488,7 @@ def _propose_grade(proj, p: Dict[str, Any]) -> Dict[str, Any]:
         "frame_paths": list(p.get("frame_paths") or []),
         "validation": {"valid": True, "notes": []},
     }
-    if not p.get("execute"):
+    if not _coerce_bool(p.get("execute")):
         payload["executed"] = False
         return payload
 
@@ -28478,7 +28731,7 @@ def _grade_evidence_base(proj, item, p: Dict[str, Any]) -> Dict[str, Any]:
     # Optional coverage (best-effort; coverage_report needs a media pool item)
     coverage_summary = None
     coverage_warnings_count = 0
-    if p.get("include_coverage", True):
+    if _coerce_bool(p.get("include_coverage"), True):
         mp_item = _timeline_item_media_pool_item(item)
         if mp_item is not None:
             try:
@@ -28658,8 +28911,8 @@ def timeline_item_color(action: str, params: Optional[Dict[str, Any]] = None) ->
     Raw mutators (UNSAFE direct mutation — prefer the safe_* sibling):
       set_cdl(cdl, ...) -> {success}
         UNSAFE. No validation; no dry_run. Prefer safe_set_cdl.
-      copy_grades(target_ids, ...) -> {success}
-        UNSAFE. No target existence check. Prefer safe_copy_grade.
+      copy_grades(target_ids, confirm_token?, ...) -> {success}
+        UNSAFE. Replaces target grades and is confirm-token gated. Prefer safe_copy_grade.
       export_lut(type, path, ...) -> {success}
         UNSAFE. No path sandboxing. Prefer safe_export_lut.
       reset_all_node_colors(...) -> {success}
@@ -28739,14 +28992,31 @@ def timeline_item_color(action: str, params: Optional[Dict[str, Any]] = None) ->
     elif action == "copy_grades":
         # Find target items by IDs
         _, tl, _ = _get_tl()
-        targets = []
-        target_ids = set(p["target_ids"])
+        target_ids = p["target_ids"]
         if tl:
-            for tt in ["video"]:
-                for ti in range(1, tl.GetTrackCount(tt) + 1):
-                    for it in (tl.GetItemListInTrack(tt, ti) or []):
-                        if it.GetUniqueId() in target_ids:
-                            targets.append(it)
+            targets, missing = _timeline_items_for_grade_copy(tl, target_ids)
+        else:
+            targets, missing = [], sorted(set(target_ids or []))
+        if not targets:
+            return _err(
+                "copy_grades resolved no target items; nothing would be copied.",
+                code="NO_COPY_GRADE_TARGETS",
+                category="invalid_input",
+                remediation="Pass at least one target_ids value that exists on the current timeline.",
+                state={"target_ids": list(target_ids or []), "missing": missing},
+            )
+        if "confirm_token" not in p and "confirmToken" not in p and _confirm_token_required():
+            preview = {
+                "operation": "timeline_item_color.copy_grades",
+                "warning": "Replaces the entire node graph on every successfully resolved target item.",
+                "target_count": len(targets),
+                "target_ids": [target.GetUniqueId() for target in targets],
+                "missing": missing,
+            }
+            return _issue_confirm_token(action="timeline_item_color.copy_grades", params=p, preview=preview)
+        blocked = _consume_confirm_token(action="timeline_item_color.copy_grades", params=p)
+        if blocked:
+            return blocked
         return {"success": bool(item.CopyGrades(targets))}
     elif action == "add_version":
         return {"success": bool(item.AddVersion(p["name"], p.get("type", 0)))}
@@ -28861,6 +29131,17 @@ def timeline_item_takes(action: str, params: Optional[Dict[str, Any]] = None) ->
     return _unknown(action, ["add","get_count","get_selected_index","get_by_index","select","delete","finalize"])
 
 
+def _index_in_range(idx, length):
+    """True for a real 0-based position. Negatives are refused: Python would read
+    `albums[-1]` as the last album and act on something nobody named."""
+    return isinstance(idx, int) and not isinstance(idx, bool) and 0 <= idx < length
+
+
+def _invalid_indices(indices, length):
+    """The entries of `indices` that are not a 0-based position below `length`."""
+    return [i for i in indices if not _index_in_range(i, length)]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TOOL 23: gallery
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -28894,13 +29175,13 @@ def gallery(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, A
     if action == "get_album_name":
         albums = gal.GetGalleryStillAlbums() or []
         idx = p.get("album_index", 0)
-        if idx < len(albums):
+        if _index_in_range(idx, len(albums)):
             return {"name": gal.GetAlbumName(albums[idx])}
         return _err("Album index out of range")
     elif action == "set_album_name":
         albums = gal.GetGalleryStillAlbums() or []
         idx = p.get("album_index", 0)
-        if idx < len(albums):
+        if _index_in_range(idx, len(albums)):
             return {"success": bool(gal.SetAlbumName(albums[idx], p["name"]))}
         return _err("Album index out of range")
     elif action == "get_current_album":
@@ -28909,7 +29190,7 @@ def gallery(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, A
     elif action == "set_current_album":
         albums = gal.GetGalleryStillAlbums() or []
         idx = p.get("album_index", 0)
-        if idx < len(albums):
+        if _index_in_range(idx, len(albums)):
             return {"success": bool(gal.SetCurrentStillAlbum(albums[idx]))}
         return _err("Album index out of range")
     elif action == "get_still_albums":
@@ -28977,7 +29258,7 @@ def gallery_stills(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
     album_idx = p.get("album_index")
     if album_idx is not None:
         albums = gal.GetGalleryStillAlbums() or []
-        if album_idx < len(albums):
+        if _index_in_range(album_idx, len(albums)):
             album = albums[album_idx]
         else:
             return _err("Album index out of range")
@@ -28995,13 +29276,13 @@ def gallery_stills(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
     elif action == "get_label":
         stills = album.GetStills() or []
         idx = p.get("still_index", 0)
-        if idx < len(stills):
+        if _index_in_range(idx, len(stills)):
             return {"label": album.GetLabel(stills[idx])}
         return _err("Still index out of range")
     elif action == "set_label":
         stills = album.GetStills() or []
         idx = p.get("still_index", 0)
-        if idx < len(stills):
+        if _index_in_range(idx, len(stills)):
             return {"success": bool(album.SetLabel(stills[idx], p["label"]))}
         return _err("Still index out of range")
     elif action == "import_stills":
@@ -29018,8 +29299,8 @@ def gallery_stills(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
             return _err("folder_path is required")
         prefix = p.get("prefix", "still")
         fmt = p.get("format", "dpx")
-        delete_after = p.get("delete_after", True)
-        cleanup = p.get("cleanup", True)
+        delete_after = _coerce_bool(p.get("delete_after"), True)
+        cleanup = _coerce_bool(p.get("cleanup"), True)
         # Redirect sandbox/temp paths that Resolve can't access
         folder_path = _resolve_safe_dir(folder_path)
         folder_pre_existed = os.path.isdir(folder_path)
@@ -29132,8 +29413,15 @@ def gallery_stills(action: str, params: Optional[Dict[str, Any]] = None) -> Dict
         return {"files": file_details, "format": used_format, "folder": folder_path, "cleaned_up": cleanup}
     elif action == "delete_stills":
         stills = album.GetStills() or []
-        to_delete = [stills[i] for i in p["still_indices"] if i < len(stills)]
-        return {"success": bool(album.DeleteStills(to_delete))} if to_delete else _err("No valid still indices")
+        still_indices = p["still_indices"]
+        if not isinstance(still_indices, list) or not still_indices:
+            return _err("still_indices must be a non-empty list of 0-based indices")
+        # A negative index is a real Python index (`stills[-1]` is the last still),
+        # and an out-of-range one used to be dropped while the rest were deleted.
+        invalid = _invalid_indices(still_indices, len(stills))
+        if invalid:
+            return _err(f"still_indices out of range for {len(stills)} stills: {invalid}")
+        return {"success": bool(album.DeleteStills([stills[i] for i in still_indices]))}
     return _unknown(action, ["get_stills","get_label","set_label","import_stills","export_stills","grab_and_export","delete_stills"])
 
 
@@ -29410,7 +29698,7 @@ def _fusion_group_settings_export(comp, p: Dict[str, Any]) -> Dict[str, Any]:
             "path": path,
             "group_name": group_name,
             "parse_warning": f"saved, but summary parse failed: {exc}",
-            **_fusion_group_advisory(p.get("include_advisory", False)),
+            **_fusion_group_advisory(_coerce_bool(p.get("include_advisory"), False)),
         }
     return {
         "success": True,
@@ -29418,7 +29706,7 @@ def _fusion_group_settings_export(comp, p: Dict[str, Any]) -> Dict[str, Any]:
         "group_name": group_name,
         "published_inputs": parsed["published_inputs"],
         "input_count": parsed["input_count"],
-        **_fusion_group_advisory(p.get("include_advisory", False)),
+        **_fusion_group_advisory(_coerce_bool(p.get("include_advisory"), False)),
     }
 
 
@@ -29453,7 +29741,7 @@ def _fusion_group_settings_splice_inputs(p: Dict[str, Any]) -> Dict[str, Any]:
         "success": True,
         "dest_path": summary["dest_path"],
         "summary": summary,
-        **_fusion_group_advisory(p.get("include_advisory", False)),
+        **_fusion_group_advisory(_coerce_bool(p.get("include_advisory"), False)),
     }
 
 
@@ -29561,7 +29849,7 @@ def _fusion_group_settings_load(comp, p: Dict[str, Any]) -> Dict[str, Any]:
             "Group preserved. If Edit Controls don't refresh, select the group in "
             "Fusion and use UI Load Settings to remap InstanceInput order."
         ),
-        **_fusion_group_advisory(p.get("include_advisory", False)),
+        **_fusion_group_advisory(_coerce_bool(p.get("include_advisory"), False)),
     }
 
 
@@ -29678,7 +29966,7 @@ def _fusion_probe_group_published_inputs(comp, p: Dict[str, Any]) -> Dict[str, A
         "live_inputs": live_inputs,
         "live_input_count": len(live_inputs),
         "file_summary": file_summary,
-        **_fusion_group_advisory(p.get("include_advisory", False)),
+        **_fusion_group_advisory(_coerce_bool(p.get("include_advisory"), False)),
     }
 
 
@@ -29829,7 +30117,7 @@ def _fusion_comp_snapshot(comp, p: Dict[str, Any]):
         max_tools = int(max_tools)
     except (TypeError, ValueError):
         max_tools = 20
-    include_io = bool(p.get("include_io", False))
+    include_io = _coerce_bool(p.get("include_io"), False)
     for idx in list(tool_list)[:max_tools]:
         tools.append(_fusion_tool_summary(tool_list[idx], include_io=include_io))
     return {
@@ -29870,7 +30158,7 @@ def _safe_add_fusion_tool(comp, p: Dict[str, Any]):
     tool_type = p.get("tool_type")
     if not tool_type:
         return _err("tool_type is required")
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(tool_type=tool_type, name=p.get("name"), would_add=True)
     comp.Lock()
     try:
@@ -29879,7 +30167,7 @@ def _safe_add_fusion_tool(comp, p: Dict[str, Any]):
             return _err(f"Failed to add tool '{tool_type}'. Check the tool ID is valid.")
         if p.get("name"):
             tool.SetAttrs({"TOOLS_Name": p["name"]})
-        return _ok(tool=_fusion_tool_summary(tool, include_io=p.get("include_io", True)))
+        return _ok(tool=_fusion_tool_summary(tool, include_io=_coerce_bool(p.get("include_io"), True)))
     finally:
         comp.Unlock()
 
@@ -29891,7 +30179,7 @@ def _probe_fusion_tool(comp, p: Dict[str, Any]):
     tool = comp.FindTool(name)
     if not tool:
         return {"found": False, "tool_name": name}
-    return {"found": True, "tool": _fusion_tool_summary(tool, include_io=p.get("include_io", True))}
+    return {"found": True, "tool": _fusion_tool_summary(tool, include_io=_coerce_bool(p.get("include_io"), True))}
 
 
 def _safe_set_fusion_inputs(comp, p: Dict[str, Any]):
@@ -29904,7 +30192,7 @@ def _safe_set_fusion_inputs(comp, p: Dict[str, Any]):
     tool = comp.FindTool(tool_name)
     if not tool:
         return _err(f"Tool '{tool_name}' not found")
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(tool_name=tool_name, inputs=inputs, would_set=True)
     results = {}
     # No comp.Lock() around value writes — see _FUSION_VALUE_WRITE_NOTE.
@@ -29915,7 +30203,7 @@ def _safe_set_fusion_inputs(comp, p: Dict[str, Any]):
             else:
                 tool.SetInput(input_name, value)
             row = {"success": True}
-            if p.get("readback", True):
+            if _coerce_bool(p.get("readback"), True):
                 try:
                     row["value"] = _ser(tool.GetInput(input_name, p["time"])) if "time" in p else _ser(tool.GetInput(input_name))
                 except Exception as exc:
@@ -29938,7 +30226,7 @@ def _safe_connect_fusion_tools(comp, p: Dict[str, Any]):
     source = comp.FindTool(source_name)
     if not source:
         return _err(f"Source tool '{source_name}' not found")
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(target_tool=target_name, source_tool=source_name, input_name=input_name, would_connect=True)
     comp.Lock()
     try:
@@ -29951,7 +30239,7 @@ def _safe_connect_fusion_tools(comp, p: Dict[str, Any]):
 def _fusion_boundary_report(comp, p: Dict[str, Any]):
     return {
         "capabilities": _fusion_graph_capabilities(comp),
-        "composition": _fusion_comp_snapshot(comp, {**p, "include_io": p.get("include_io", True)}),
+        "composition": _fusion_comp_snapshot(comp, {**p, "include_io": _coerce_bool(p.get("include_io"), True)}),
     }
 
 
@@ -30085,7 +30373,7 @@ def _fusion_add_mask(comp, p: Dict[str, Any]) -> Dict[str, Any]:
 
     x = p.get("x", -1)
     y = p.get("y", -1)
-    readback = bool(p.get("readback", True))
+    readback = _coerce_bool(p.get("readback"), True)
 
     # The lock covers only the STRUCTURAL half (AddTool + rename). The input
     # writes below must run outside it — see _FUSION_VALUE_WRITE_NOTE: a value
@@ -30237,7 +30525,7 @@ def _fusion_set_text_plus(comp, p: Dict[str, Any]) -> Dict[str, Any]:
     if err:
         return err
     input_id = p.get("input_name", "StyledText")
-    readback = bool(p.get("readback", True))
+    readback = _coerce_bool(p.get("readback"), True)
     # No comp.Lock() around a value write — see _FUSION_VALUE_WRITE_NOTE.
     try:
         tool.SetInput(input_id, text)
@@ -30269,6 +30557,80 @@ def _fusion_keyframe_frames(inp) -> List[float]:
     if not kfs:
         return []
     return sorted(float(frame) for frame in kfs.values())
+
+
+#: Modifier names callers use -> the registry ID `Tool.AddModifier` wants.
+#: Measured on Studio 19.1.3.7 (issue #250) on a TextPlus StyledText input:
+#: AddModifier("StyledText", "Follower") and "TextFollower" return False and
+#: attach nothing; "StyledTextFollower" returns True, creates a `Follower1` tool
+#: of that ID and connects it to the input. Spline modifiers already go by their
+#: registry ID (BezierSpline, Path). Keys are compared case-insensitively.
+_FUSION_MODIFIER_IDS = {
+    "follower": "StyledTextFollower",
+    "textfollower": "StyledTextFollower",
+    "styledtextfollower": "StyledTextFollower",
+}
+
+
+def _fusion_modifier_id(name: Any) -> str:
+    """The registry ID for a modifier a caller named; unknown names pass through."""
+    text = str(name or "").strip()
+    return _FUSION_MODIFIER_IDS.get(text.lower(), text)
+
+
+def _fusion_nest_members(tool, input_name: str):
+    """(is_nest, member_ids) for an input that is a Fusion NestControl header.
+
+    Measured on Studio 19.1.3.7 (issue #253): inputs whose `INPID_InputControl`
+    is "NestControl" (`INPB_Passive` true) are the fold-down group headers the
+    Fusion UI draws — TextPlus `Softness1`, Follower `TransformSize`, `Softness1`,
+    `Size1` — not animatable values. `Tool.AddModifier` returns False for them on
+    every modifier type, and so did every attempt to keyframe them. The controls
+    the header folds are the next `INPI_LabelControl_NumInputs` entries in
+    `GetInputList()` order (Softness1 -> SoftnessX1, SoftnessY1,
+    SoftnessOnFillColorToo1, SoftnessGlow1, SoftnessBlend1; TransformSize ->
+    Line/Word/CharacterSize X and Y), and those take a spline normally.
+    """
+    try:
+        attrs = tool[input_name].GetAttrs() or {}
+    except Exception:
+        return False, []
+    if attrs.get("INPID_InputControl") != "NestControl":
+        return False, []
+    try:
+        count = int(attrs.get("INPI_LabelControl_NumInputs") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    members: List[str] = []
+    try:
+        input_list = tool.GetInputList() or {}
+        keys = list(input_list.keys())
+        try:
+            keys.sort(key=float)
+        except (TypeError, ValueError):
+            pass
+        ids = [((input_list[k].GetAttrs() or {}).get("INPS_ID") or "") for k in keys]
+        if input_name in ids:
+            start = ids.index(input_name) + 1
+            members = [i for i in ids[start:start + count] if i]
+    except Exception:
+        members = []
+    return True, members
+
+
+def _fusion_nest_control_error(tool_name: str, input_name: str, members: List[str], verb: str):
+    listed = ", ".join(members) if members else "see get_inputs(tool_name)"
+    return _err(
+        f"'{input_name}' on '{tool_name}' is a nest control (a group header), "
+        f"not an animatable input; it cannot be {verb}.",
+        code="FUSION_INPUT_IS_NEST_CONTROL", category="invalid_input", retryable=False,
+        reason="Fusion NestControl inputs are passive headers that fold a group of "
+               "controls. Tool.AddModifier returns False for them on every modifier "
+               "type (measured on Studio 19.1.3.7: TextPlus Softness1, Follower "
+               "TransformSize / Softness1 / Size1).",
+        remediation=f"Target one of the controls the nest folds instead: {listed}.",
+        state={"nest_control": input_name, "nest_members": members},
+    )
 
 
 def _fusion_input_spline(inp):
@@ -30424,7 +30786,20 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
       get_input(tool_name, input_name, time?) -> {value}
       set_attrs(tool_name, attrs) -> {success}
       get_attrs(tool_name) -> {attrs}
-      add_keyframe(tool_name, input_name, time, value) -> {success}
+      add_keyframe(tool_name, input_name, time, value, modifier?) -> {success}
+        Attaches a BezierSpline (or `modifier`, e.g. 'Path' for Point inputs)
+        the first time an input is animated. Modifier names are mapped to
+        their registry ID ('Follower' -> 'StyledTextFollower'). A nest control
+        (a fold-down group header such as Softness1 or TransformSize) is refused
+        with FUSION_INPUT_IS_NEST_CONTROL naming the controls it folds
+        (SoftnessX1/SoftnessY1, ...): keyframe those.
+      add_modifier(tool_name, input_name, modifier) -> {success, modifier_tool, modifier_type}
+        Attach any modifier and return the tool Fusion created for it, so a
+        TEXT modifier (Follower on a TextPlus StyledText) can then be driven
+        with set_input / add_keyframe on that tool (e.g. Delay). Refuses an
+        input that already has a modifier. Measured on Studio 19.1.3.7:
+        Fusion wants the registry ID ('StyledTextFollower'); 'Follower' is
+        mapped for you.
       get_keyframes(tool_name, input_name) -> {keyframes}
       delete_keyframe(tool_name, input_name, time) -> {success, time, remaining_keyframes}
         Deletes on the spline attached to the input. Structured errors when the
@@ -30697,13 +31072,18 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
             except Exception:
                 _already_animated = False
             if not _already_animated:
+                _is_nest, _members = _fusion_nest_members(tool, p["input_name"])
+                if _is_nest:
+                    return _fusion_nest_control_error(
+                        p["tool_name"], p["input_name"], _members, "keyframed")
                 # AddModifier reports through the Lua bridge, which resolves an
                 # unknown attribute to None rather than raising, so the return is
                 # not reliable evidence on its own. The readback below is: if the
                 # input still has no connected output, the assignment on the next
                 # line would set a STATIC value and _ok() would report a keyframe
                 # that does not exist.
-                tool.AddModifier(p["input_name"], p.get("modifier", "BezierSpline"))
+                _modifier_id = _fusion_modifier_id(p.get("modifier", "BezierSpline"))
+                tool.AddModifier(p["input_name"], _modifier_id)
                 try:
                     attached = tool[p["input_name"]].GetConnectedOutput() is not None
                 except Exception:
@@ -30719,11 +31099,87 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
                                "Reporting success here would claim a keyframe that "
                                "does not exist.",
                         remediation="Check the input accepts the modifier type "
-                                    f"({p.get('modifier', 'BezierSpline')!r}); Point "
-                                    "inputs take 'Path'.",
+                                    f"({_modifier_id!r}); Point inputs take 'Path'. "
+                                    "A TEXT modifier (Follower) is not a spline: "
+                                    "attach it with add_modifier, then drive the "
+                                    "modifier tool it returns.",
                     )
             tool[p["input_name"]][p["time"]] = p["value"]
             return _ok()
+        finally:
+            comp.EndUndo(True)
+
+    elif action == "add_modifier":
+        tool = comp.FindTool(p["tool_name"])
+        if not tool:
+            return _err(f"Tool '{p['tool_name']}' not found")
+        input_name = p.get("input_name")
+        requested = p.get("modifier")
+        if not input_name or not requested:
+            return _err("add_modifier requires input_name and modifier",
+                        category="invalid_input")
+        inp = tool[input_name]
+        if not inp:
+            return _err(f"Input '{input_name}' not found on tool '{p['tool_name']}'")
+        modifier_id = _fusion_modifier_id(requested)
+        is_nest, members = _fusion_nest_members(tool, input_name)
+        if is_nest:
+            return _fusion_nest_control_error(p["tool_name"], input_name, members,
+                                              "given a modifier")
+        try:
+            existing = inp.GetConnectedOutput()
+        except Exception:
+            existing = None
+        if existing is not None:
+            existing_tool = existing.GetTool()
+            attrs = (existing_tool.GetAttrs() or {}) if existing_tool else {}
+            return _err(
+                f"'{p['tool_name']}.{input_name}' already has a modifier attached.",
+                code="FUSION_INPUT_ALREADY_CONNECTED", category="precondition",
+                retryable=False,
+                state={"modifier_tool": attrs.get("TOOLS_Name", ""),
+                       "modifier_type": attrs.get("TOOLS_RegID", "")},
+                remediation="Drive the existing modifier tool, or "
+                            "disconnect(tool_name, input_name) first.",
+            )
+        # Same undo bracket as add_keyframe; no comp.Lock() — a lock is for
+        # value writes and this is a graph edit, but see _FUSION_VALUE_WRITE_NOTE
+        # for why writes under a lock are not trusted here.
+        comp.StartUndo(f"Add modifier {modifier_id} to {input_name}")
+        try:
+            tool.AddModifier(input_name, modifier_id)
+            # AddModifier's bool is unreliable through the Lua bridge (an unknown
+            # attribute resolves to None). The readback is the evidence: the
+            # input must now be connected to a modifier tool.
+            try:
+                out = tool[input_name].GetConnectedOutput()
+            except Exception:
+                out = None
+            modifier_tool = out.GetTool() if out else None
+            if modifier_tool is None:
+                return _err(
+                    f"Could not attach {modifier_id!r} to "
+                    f"'{p['tool_name']}.{input_name}': no modifier is connected "
+                    "after AddModifier.",
+                    code="FUSION_ADD_MODIFIER_FAILED", category="api_error",
+                    retryable=False,
+                    reason="Fusion rejects a modifier whose registry ID it does not "
+                           "know for that input type, and reports it only as False.",
+                    remediation="Pass the modifier's REGISTRY ID, not its display "
+                                "name: the text Follower is 'StyledTextFollower' "
+                                "(add_modifier maps 'Follower' to it; measured on "
+                                "Studio 19.1.3.7). Spline modifiers are "
+                                "'BezierSpline' and, for Point inputs, 'Path'.",
+                )
+            attrs = modifier_tool.GetAttrs() or {}
+            return _ok(
+                tool_name=p["tool_name"], input_name=input_name,
+                requested=requested, modifier_id=modifier_id,
+                modifier_tool=attrs.get("TOOLS_Name", ""),
+                modifier_type=attrs.get("TOOLS_RegID", modifier_id),
+                next="Drive the modifier tool with set_input / add_keyframe "
+                     "(e.g. its Delay input for a per-character stagger).",
+            )
         finally:
             comp.EndUndo(True)
 
@@ -30788,7 +31244,7 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         return _ok()
 
     elif action == "end_undo":
-        comp.EndUndo(p.get("keep", True))
+        comp.EndUndo(_coerce_bool(p.get("keep"), True))
         return _ok()
 
     # --- Node Layout (FlowView) ---
@@ -30916,7 +31372,7 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         "add_tool","delete_tool","get_tool_list","find_tool",
         "connect","disconnect","get_inputs","get_outputs",
         "set_input","get_input","set_attrs","get_attrs",
-        "add_keyframe","get_keyframes","delete_keyframe",
+        "add_keyframe","add_modifier","get_keyframes","delete_keyframe",
         "get_comp_info","set_frame_range","get_frame_range","render",
         "start_undo","end_undo",
         "get_position","set_position","copy_tool","auto_arrange",
@@ -31040,7 +31496,7 @@ def fuse_plugin(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         d = _fuses_dir()
         if not os.path.isdir(d):
             return {"fuses": []}
-        show_all = bool(p.get("all", False))
+        show_all = _coerce_bool(p.get("all"), False)
         out = []
         for fn in sorted(os.listdir(d)):
             if not fn.endswith(".fuse"):
@@ -31067,7 +31523,7 @@ def fuse_plugin(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         d = _fuses_dir()
         os.makedirs(d, exist_ok=True)
         path = _fuse_path(name)
-        if os.path.exists(path) and not p.get("overwrite", False):
+        if os.path.exists(path) and not _coerce_bool(p.get("overwrite")):
             return _err(f"Fuse '{name}' already exists at {path}. "
                         "Pass overwrite=true to replace it.")
         try:
@@ -31308,22 +31764,22 @@ def lut(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if action == "install":
             if not p.get("name"):
                 return _err("install requires name")
-            if p.get("dry_run"):
+            if _coerce_bool(p.get("dry_run")):
                 return _ok(would_install=p["name"], writable_dir=lut_files.writable_dir())
             return lut_files.install_lut(
                 p["name"], source=p.get("source"), source_path=p.get("source_path"),
-                overwrite=bool(p.get("overwrite", False)))
+                overwrite=_coerce_bool(p.get("overwrite")))
         if action == "remove":
             if not p.get("name"):
                 return _err("remove requires name")
-            if p.get("dry_run"):
+            if _coerce_bool(p.get("dry_run")):
                 return _ok(would_remove=p["name"], writable_dir=lut_files.writable_dir())
             return lut_files.remove_lut(p["name"])
         if action == "attenuate":
             for required in ("source", "strength", "name"):
                 if p.get(required) is None:
                     return _err(f"attenuate requires {required}")
-            if p.get("dry_run"):
+            if _coerce_bool(p.get("dry_run")):
                 return _ok(would_write=p["name"], source=p["source"], strength=p["strength"])
             return lut_files.attenuate_lut(p["source"], p["strength"], p["name"])
     except lut_files.LutPathError as exc:
@@ -31419,7 +31875,7 @@ def dctl(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         root = root if sd is None else os.path.join(root, sd)
         if not os.path.isdir(root):
             return {"files": []}
-        show_all = bool(p.get("all", False))
+        show_all = _coerce_bool(p.get("all"), False)
         out = []
         for fn in sorted(os.listdir(root)):
             if not fn.lower().endswith(_DCTL_VALID_EXT):
@@ -31460,7 +31916,7 @@ def dctl(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         target_dir = root if sd is None else os.path.join(root, sd)
         os.makedirs(target_dir, exist_ok=True)
         path = os.path.join(target_dir, f"{name}{ext}")
-        if os.path.exists(path) and not p.get("overwrite", False):
+        if os.path.exists(path) and not _coerce_bool(p.get("overwrite")):
             return _err(f"DCTL '{name}{ext}' already exists at {path}. "
                         "Pass overwrite=true to replace it.")
         try:
@@ -31653,8 +32109,8 @@ _EXTENSION_KERNEL_ACTIONS = [
 _EXTENSION_TYPES = ("fuse", "dctl", "script")
 
 
-def _extension_safe_name(name: Any, *, allow_non_mcp_name: bool = False) -> Optional[Dict[str, Any]]:
-    if allow_non_mcp_name:
+def _extension_safe_name(name: Any, *, allow_non_mcp_name: Any = False) -> Optional[Dict[str, Any]]:
+    if _coerce_bool(allow_non_mcp_name):
         if isinstance(name, str) and name:
             return None
         return _err("name must be a non-empty string")
@@ -31840,7 +32296,7 @@ def _safe_install_extension(p: Dict[str, Any]) -> Dict[str, Any]:
     if err:
         return err
     name = p.get("name") or _extension_template_name(extension_type, p.get("kind", "lifecycle"))
-    invalid = _extension_safe_name(name, allow_non_mcp_name=p.get("allow_non_mcp_name", False))
+    invalid = _extension_safe_name(name, allow_non_mcp_name=_coerce_bool(p.get("allow_non_mcp_name"), False))
     if invalid:
         return invalid
     source = p.get("source")
@@ -31867,9 +32323,9 @@ def _safe_install_extension(p: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(source, str) or not source.strip():
         return _err("source must be a non-empty string")
     marker = {"fuse": _FUSE_MARKER, "dctl": _DCTL_MARKER, "script": _SCRIPT_MARKER}[extension_type]
-    if p.get("require_marker", True) and not _source_has_marker(source, marker):
+    if _coerce_bool(p.get("require_marker"), True) and not _source_has_marker(source, marker):
         return _err(f"source must include {marker} unless require_marker=False")
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(
             would_install=True,
             extension_type=extension_type,
@@ -31880,7 +32336,7 @@ def _safe_install_extension(p: Dict[str, Any]) -> Dict[str, Any]:
             }),
         )
     if extension_type == "fuse":
-        return fuse_plugin("install", {"name": name, "source": source, "overwrite": p.get("overwrite", False)})
+        return fuse_plugin("install", {"name": name, "source": source, "overwrite": _coerce_bool(p.get("overwrite"), False)})
     if extension_type == "dctl":
         category = p.get("category") or dctl_templates.KIND_CATEGORY.get(kind, "lut")
         return dctl("install", {
@@ -31889,7 +32345,7 @@ def _safe_install_extension(p: Dict[str, Any]) -> Dict[str, Any]:
             "category": category,
             "subdir": p.get("subdir"),
             "ext": p.get("ext", ".dctl"),
-            "overwrite": p.get("overwrite", False),
+            "overwrite": _coerce_bool(p.get("overwrite"), False),
         })
     language = _normalize_script_language(p.get("language", options.get("language", "lua")))
     category = p.get("script_category", p.get("category", "Utility"))
@@ -31899,7 +32355,7 @@ def _safe_install_extension(p: Dict[str, Any]) -> Dict[str, Any]:
     validation = _validate_script_source(source, language)
     if validation.get("valid") is False:
         return _err(f"Script validation failed: {validation.get('errors')}")
-    return _script_install_source(name, source, category, language, p.get("overwrite", False))
+    return _script_install_source(name, source, category, language, _coerce_bool(p.get("overwrite")))
 
 
 def _safe_remove_extension(p: Dict[str, Any]) -> Dict[str, Any]:
@@ -31907,7 +32363,7 @@ def _safe_remove_extension(p: Dict[str, Any]) -> Dict[str, Any]:
     if err:
         return err
     name = p.get("name")
-    invalid = _extension_safe_name(name, allow_non_mcp_name=p.get("allow_non_mcp_name", False))
+    invalid = _extension_safe_name(name, allow_non_mcp_name=_coerce_bool(p.get("allow_non_mcp_name"), False))
     if invalid:
         return invalid
     if extension_type == "fuse":
@@ -31947,9 +32403,9 @@ def _safe_remove_extension(p: Dict[str, Any]) -> Dict[str, Any]:
         marker = _SCRIPT_MARKER
     if not os.path.isfile(path):
         return _err(f"No {extension_type} extension named '{name}' at {path}")
-    if p.get("require_marker", True) and not _file_has_marker(path, marker):
+    if _coerce_bool(p.get("require_marker"), True) and not _file_has_marker(path, marker):
         return _err(f"Refusing to remove unmarked file at {path}; pass require_marker=False only if you intend this")
-    if p.get("dry_run"):
+    if _coerce_bool(p.get("dry_run")):
         return _ok(would_remove=True, extension_type=extension_type, name=name, path=path)
     try:
         os.unlink(path)
@@ -31974,19 +32430,19 @@ def _probe_fuse_lifecycle(p: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(source, str):
         out["has_marker"] = _source_has_marker(source, _FUSE_MARKER)
         out["validation"] = fuse_plugin("validate", {"source": source})
-    if p.get("include_template_matrix"):
+    if _coerce_bool(p.get("include_template_matrix")):
         out["template_matrix"] = _extension_template_matrix()["fuse"]
-    if p.get("install"):
+    if _coerce_bool(p.get("install")):
         install = script_plugin("safe_install_extension", {
             "extension_type": "fuse",
             "name": name,
             "source": source,
-            "overwrite": p.get("overwrite", True),
+            "overwrite": _coerce_bool(p.get("overwrite"), True),
         })
         out["install"] = install
         out["read"] = fuse_plugin("read", {"name": name}) if install.get("success") else None
         out["list"] = fuse_plugin("list")
-        if p.get("cleanup", True):
+        if _coerce_bool(p.get("cleanup"), True):
             out["remove"] = script_plugin("safe_remove_extension", {"extension_type": "fuse", "name": name})
     return out
 
@@ -32011,29 +32467,29 @@ def _probe_dctl_lifecycle(p: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(source, str):
         out["has_marker"] = _source_has_marker(source, _DCTL_MARKER)
         out["validation"] = dctl("validate", {"source": source})
-    if p.get("include_template_matrix"):
+    if _coerce_bool(p.get("include_template_matrix")):
         out["template_matrix"] = _extension_template_matrix()["dctl"]
-    if p.get("install"):
+    if _coerce_bool(p.get("install")):
         install = script_plugin("safe_install_extension", {
             "extension_type": "dctl",
             "name": name,
             "source": source,
             "category": category,
             "subdir": subdir,
-            "overwrite": p.get("overwrite", True),
+            "overwrite": _coerce_bool(p.get("overwrite"), True),
         })
         out["install"] = install
         out["read"] = dctl("read", {"name": name, "category": category, "subdir": subdir}) if install.get("success") else None
         out["list"] = dctl("list", {"category": category, "subdir": subdir})
-        if p.get("refresh_luts") and category == "lut":
+        if _coerce_bool(p.get("refresh_luts")) and category == "lut":
             out["refresh_luts"] = project_settings("refresh_luts")
-        if p.get("cleanup", True):
+        if _coerce_bool(p.get("cleanup"), True):
             out["remove"] = script_plugin("safe_remove_extension", {"extension_type": "dctl", "name": name, "category": category, "subdir": subdir})
     return out
 
 
 def _probe_script_lifecycle(p: Dict[str, Any]) -> Dict[str, Any]:
-    if p.get("execute"):
+    if _coerce_bool(p.get("execute")):
         # Refused rather than ignored: silently skipping it would report a
         # lifecycle probe as complete for a step it never ran.
         return _err(
@@ -32063,21 +32519,21 @@ def _probe_script_lifecycle(p: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(source, str):
         out["has_marker"] = _source_has_marker(source, _SCRIPT_MARKER)
         out["validation"] = script_plugin("validate", {"source": source, "language": language})
-    if p.get("include_template_matrix"):
+    if _coerce_bool(p.get("include_template_matrix")):
         out["template_matrix"] = _extension_template_matrix()["script"]
-    if p.get("install"):
+    if _coerce_bool(p.get("install")):
         install = script_plugin("safe_install_extension", {
             "extension_type": "script",
             "name": name,
             "source": source,
             "category": category,
             "language": language,
-            "overwrite": p.get("overwrite", True),
+            "overwrite": _coerce_bool(p.get("overwrite"), True),
         })
         out["install"] = install
         out["read"] = script_plugin("read", {"name": name, "category": category, "language": language}) if install.get("success") else None
         out["list"] = script_plugin("list", {"category": category, "language": language})
-        if p.get("cleanup", True):
+        if _coerce_bool(p.get("cleanup"), True):
             out["remove"] = script_plugin("safe_remove_extension", {
                 "extension_type": "script",
                 "name": name,
@@ -32088,7 +32544,7 @@ def _probe_script_lifecycle(p: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _extension_boundary_report(p: Dict[str, Any]) -> Dict[str, Any]:
-    include_matrix = p.get("include_template_matrix", True)
+    include_matrix = _coerce_bool(p.get("include_template_matrix"), True)
     return {
         "capabilities": _extension_capabilities(),
         "refresh_restart": {
@@ -32209,7 +32665,7 @@ def script_plugin(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
         if language_filter and language_filter not in _SCRIPT_VALID_LANG:
             return _err(f"Invalid language '{language_filter}'. "
                         f"Valid: {list(_SCRIPT_VALID_LANG)}; aliases: ['python', 'python3']")
-        show_all = bool(p.get("all", False))
+        show_all = _coerce_bool(p.get("all"), False)
 
         paths = get_resolve_plugin_paths()
         if category:
@@ -32270,7 +32726,7 @@ def script_plugin(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
             return _err(str(e))
         os.makedirs(target_dir, exist_ok=True)
         path = os.path.join(target_dir, f"{name}{_SCRIPT_LANG_EXT[language]}")
-        if os.path.exists(path) and not p.get("overwrite", False):
+        if os.path.exists(path) and not _coerce_bool(p.get("overwrite")):
             return _err(f"Script '{name}{_SCRIPT_LANG_EXT[language]}' already "
                         f"exists at {path}. Pass overwrite=true to replace it.")
         try:
@@ -32432,7 +32888,7 @@ def knowledge(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str,
             return _ok(**_knowledge_mod.get(
                 str(p["topic"]),
                 section=str(section) if section else None,
-                inline=bool(p.get("inline", True)),
+                inline=_coerce_bool(p.get("inline"), True),
             ))
         if action == "search":
             err, _clean = _validate_params(p, {
@@ -32722,7 +33178,9 @@ if __name__ == "__main__":
         logger.info("Starting full 377-tool granular server...")
         sys.argv = [arg for arg in sys.argv if arg != "--full"]
         from src.granular import mcp as granular_mcp
+        from src.granular.common import connect_at_startup
 
+        connect_at_startup()
         _install_threaded_tool_dispatch(granular_mcp)
         run_fastmcp_stdio(granular_mcp)
         sys.exit(0)

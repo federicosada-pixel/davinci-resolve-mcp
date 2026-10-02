@@ -353,7 +353,7 @@ to the user as verified.
 | Mode | Entry point | Tool count | Use when |
 |---|---|---|---|
 | Compound (default) | `src/server.py` | 37 tools | Most workflows — keeps context lean |
-| Granular (full) | `src/server.py --full` | 387 tools | Power users needing one tool per API method |
+| Granular (full) | `src/server.py --full` | 389 tools | Power users needing one tool per API method |
 
 Resolve 21.1 adds [twelve read-only discovery controls](reference/resolve211-read-controls.md)
 for edition, presets, audio formats/codecs, normalization modes, speed, fades
@@ -361,6 +361,21 @@ and blanking in both server interfaces. These readers do not invoke setters.
 
 This skill document covers the **compound server** (the default). Each compound
 tool accepts an `action` string and an optional `params` object.
+
+**Granular writes are enforced, not archived.** Every destructive-hinted granular
+tool (deletes, clears, resets, replaces, sets, loads — 132 of the 387) runs
+through `granular_destructive_op`: while `destructive.safe_mode` is on, a
+HIGH-risk call is refused unless that call passes `allow_risky_operation: true`
+(a parameter the hook adds to each hooked tool's schema), and every call writes
+a row to the security audit log. Risk is read from the verb — `delete`/`remove`/
+`clear`/`reset`/`replace`/`unlink`/`quit`/`restart` are HIGH, `set`/`load`/
+`switch`/`close`/`stop` are MEDIUM — except that a tool reaching a symbol the
+`api_truth` ledger marks `destroys_prior_work` is HIGH from the ledger
+(`ti_copy_grades`), and those tools also keep their `acknowledge_trap` +
+confirm-token gate. What the granular hook does **not** do is duplicate the
+timeline into an Archive bin first, as the compound hook does: a granular write
+has no recovery version, and a refused-or-audited call is the whole of its
+safety. Use the compound server when you want the archive.
 
 ### The advanced server (`davinci-resolve-advanced-mcp`)
 
@@ -388,7 +403,17 @@ Operating rules an agent must know:
   has no API). Single clip, live: `gallery_stills.grab_and_export` → advanced
   `drx(action="relayout")` → `graph.reset_all_grades` → `safe_apply_drx` with
   EXPLICIT item indices (the reset is required — a same-structure apply keeps
-  the old layout). Whole project, offline: `project_db(action="relayout_node_graphs")`.
+  the old layout). Whole project, offline: `project_db(action="relayout_node_graphs")`
+  (closed project + quit/relaunch). Whole project or ANY SUBSET **without closing it**:
+  `project_manager.export_project` → advanced `drp(action="relayout_node_graphs")`
+  (scope by timeline/track/clip id/name/media/frames/clip position/group/version/node
+  count/node label; covers every LOCAL version of every clip, remote versions, group
+  pre/post and timeline graphs; dry-run first, read-back verified on write) →
+  `project_manager.import_project` as a sibling `<name>_CLEANED`, then re-export THAT
+  and dry-run again to prove the effect. BPA's "Node Graph Cleanup" job is this loop.
+  Layout is topology-aware (rank by RGB wiring, branches stacked into lanes at
+  `spacingY`, key links untouched); the lane pitch is NOT measured against native
+  Cleanup on a mixer graph yet — the x row is.
 - **project_db patches** require the project CLOSED in Resolve plus
   `iConfirmProjectClosed:true`; every write auto-backs-up and read-back
   verifies. Resolve caches open projects in memory: after patching, fully QUIT
@@ -796,6 +821,19 @@ Key actions: `list`, `list_attributes`, `get_current`,
 `notes`, and `liveCollaborationMode` per project in the current folder without
 loading any of them.
 
+`snapshot(include?, track_types?, item_limit?)` is the one read to make before
+planning: `project`, `timeline` (per-track items), `gaps_overlaps`, `render`
+(`is_rendering` plus each job's status) and `media_pool` counts in a single
+read-only call, instead of `get_current` + `timeline.get_current` +
+`probe_timeline_structure` + `detect_gaps_overlaps` + `render.is_rendering` one
+turn at a time. `include` picks sections, `item_limit` (default 200) caps the
+items returned and sets `timeline.items_truncated`, and a section that fails
+reports `{error}` in its own place. It saves turns and response size, not read
+time: the timeline sections cost what `probe_timeline_structure` costs and
+`media_pool` walks every pool clip, so on a large project pass `include` with
+only the sections you need. Frame fields are `probe_timeline_structure`'s,
+unchanged.
+
 Project / Database / Archive kernel actions (v2.15.0+) add guarded project
 lifecycle, settings, database, preset, and archive boundary helpers:
 
@@ -805,7 +843,11 @@ lifecycle, settings, database, preset, and archive boundary helpers:
 - `safe_project_create(name, media_location_path?, dry_run?)`
 - `safe_project_export(name, path, with_stills_and_luts?, dry_run?)`
 - `safe_project_import(path, name, dry_run?)`
-- `safe_project_archive(name, path, src_media=false, render_cache=false, proxy_media=false, dry_run?)`
+- `safe_project_archive(name, path, src_media=false, render_cache=false, proxy_media=false, allow_media_archive?, acknowledge_trap?, dry_run?)`
+  — `src_media` and `proxy_media` crash Resolve 21.1.0.14 (reported, #233); they are refused
+  unless `acknowledge_trap=true`, and every flag defaults off on `archive` too. No
+  scriptable call has produced an archive on 19.1.3.7 or 21.1.0.14; see
+  `docs/reference/project-archive.md`.
 - `safe_project_restore(path, name, dry_run?)`
 - `safe_project_delete(name, close_current?, dry_run?)`
 - `safe_set_project_settings(settings, restore?, dry_run?)`
@@ -879,6 +921,21 @@ Key actions: `get_root_folder`, `get_current_folder`, `set_current_folder(path)`
 `import_media(paths)`, `delete_clips(clip_ids)`, `move_clips(clip_ids, target_path)`,
 `setup_multicam_timeline(name, clip_ids|angles, sync_mode?, include_audio?, dry_run?)`,
 `get_selected`, `set_selected(clip_id)`, `export_metadata(path, clip_ids?)`
+
+Every `clip_ids` batch is all-or-nothing: `delete_clips`, `move_clips`, `relink`,
+`unlink`, `create_timeline_from_clips`, `append_to_timeline`, `export_metadata`
+and `auto_sync_audio`. If any id in `clip_ids` matches no clip, the call fails
+with `CLIP_NOT_FOUND` (the unresolved and resolved ids are in `error.state`) and
+nothing reaches Resolve: no clip is changed, no timeline is created, nothing is
+appended, exported or synced. Drop the stale ids and retry; do not read a partial
+batch as done. `export_metadata` without `clip_ids` still exports every clip, but
+an empty `clip_ids: []` is `INVALID_CLIP_IDS`, not "everything". The granular
+server's `append_to_timeline`, `auto_sync_audio`, `delete_media_pool_clips` and
+`move_clips_to_folder` behave the same way, with the ids in
+`unresolved_clip_ids` / `resolved_clip_ids`. `delete_folders(folder_ids)` and
+`move_folders(folder_ids, target_path)` work the same way with
+`FOLDER_NOT_FOUND`; they resolve `folder_ids` at any depth (pass the ids
+`folder get_subfolders` returns) and refuse the Master folder itself.
 
 Media Pool / Ingest kernel actions (v2.8.0+) add safer agent-facing workflows:
 `ingest_capabilities`, `probe_media_pool`, `probe_ingest_item`,
@@ -1996,7 +2053,16 @@ Key actions:
   `get_input(tool_name, input_name, time?)`
 - `get_inputs(tool_name)` / `get_outputs(tool_name)`
 - `set_attrs(tool_name, attrs)` / `get_attrs(tool_name)`
-- `add_keyframe(tool_name, input_name, time, value)`
+- `add_keyframe(tool_name, input_name, time, value, modifier?)` — attaches a
+  BezierSpline (or `modifier`, e.g. `Path` for Point inputs) on first use. A nest
+  control (a fold-down group header like `Softness1` or the Follower's
+  `TransformSize`) is refused with `FUSION_INPUT_IS_NEST_CONTROL` naming the
+  controls it folds (`SoftnessX1`/`SoftnessY1`, `CharacterSizeX`/`Y`, ...); keyframe those
+- `add_modifier(tool_name, input_name, modifier)` → `{modifier_tool, modifier_type}`
+  — attach any modifier and get back the tool Fusion created, so a text modifier
+  (`Follower` on a TextPlus `StyledText`) can be driven with `set_input` /
+  `add_keyframe` on that tool (e.g. `Delay`). Fusion wants the registry ID
+  (`StyledTextFollower`, measured on Studio 19.1.3.7); `Follower` is mapped for you
 - `get_position(tool_name)` / `set_position(tool_name, x, y)` — read/write a node's
   position on the FlowView canvas; `set_position` returns a position read-back
 - `copy_tool(tool_name, name?, x?, y?)` — duplicate a node (settings copied via a
@@ -2125,6 +2191,13 @@ media_pool(action="append_to_timeline", params={"clip_infos": [
   {"clip_id": "<uuid>", "start_frame": 0, "end_frame": 100, "record_frame": 1200, "track_index": 4}
 ]})
 ```
+
+When Resolve answers `AppendToTimeline` with None/False/[], either form fails
+with `APPEND_TO_TIMELINE_FAILED`, not `success` with `count: 0`, and keeps
+`verified_operation` (the current timeline's item count before and after) on
+the error. `error.retryable` is true only when that readback shows nothing was
+appended; otherwise inspect the timeline before retrying, or the clips can land
+twice. The granular `append_to_timeline` answers `{"success": false, "error": ...}`.
 
 Mixed-fps caution: `start_frame`/`end_frame` are SOURCE frames, and a source
 whose fps differs from the timeline's rounds DOWN on conversion — a 24.0 or

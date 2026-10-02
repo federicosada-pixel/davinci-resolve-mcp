@@ -39,7 +39,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from tests import offline_guard  # noqa: E402 - after the sys.path fix above
-from tests.offline_guard import LAUNCH_ATTEMPTS  # noqa: F401 - re-exported
+from tests.offline_guard import LAUNCH_ATTEMPTS, NETWORK_ATTEMPTS  # noqa: F401 - re-exported
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -70,6 +70,20 @@ def _no_cached_resolve_handle_between_tests():
         offline_guard.clear_cached_handle()
 
 
+@pytest.fixture(autouse=True)
+def _fail_a_test_that_reaches_a_launcher():
+    """The launch check for plain test functions.
+
+    A `unittest.TestCase` is failed by the guard's `TestCase.run` wrapper, which
+    has marked its attempts reported before this runs. Plain functions never
+    pass through that wrapper, so they are checked here.
+    """
+    yield
+    pending = offline_guard.unreported_launch_attempts()
+    if pending:
+        pytest.fail(offline_guard.launch_failure_message(pending), pytrace=False)
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     if LAUNCH_ATTEMPTS:
         terminalreporter.write_line("")
@@ -79,3 +93,13 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         )
         for where in dict.fromkeys(LAUNCH_ATTEMPTS):
             terminalreporter.write_line("  " + where, red=True)
+    if NETWORK_ATTEMPTS:
+        terminalreporter.write_line("")
+        terminalreporter.write_line(
+            "offline suite refused %d outbound request(s):" % len(NETWORK_ATTEMPTS),
+            red=True,
+        )
+        for attempt in NETWORK_ATTEMPTS:
+            terminalreporter.write_line(
+                "  %(url)s\n    from %(caller)s\n    in %(test)s" % attempt, red=True
+            )

@@ -2,10 +2,10 @@
 
 English | [简体中文](README.zh-CN.md)
 
-[![Version](https://img.shields.io/badge/version-4.1.3-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
+[![Version](https://img.shields.io/badge/version-4.8.20-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
 [![npm](https://img.shields.io/npm/v/davinci-resolve-mcp.svg?label=npm&color=CB3837)](https://www.npmjs.com/package/davinci-resolve-mcp)
 [![API Coverage](https://img.shields.io/badge/API%20Coverage-100%25-brightgreen.svg)](docs/reference/api-coverage.md)
-[![Tools](https://img.shields.io/badge/MCP%20Tools-37%20(387%20full)-blue.svg)](#server-modes)
+[![Tools](https://img.shields.io/badge/MCP%20Tools-37%20(389%20full)-blue.svg)](#server-modes)
 [![Advanced](https://img.shields.io/badge/Advanced%20(offline)-18%20tools-blueviolet.svg)](#server-modes)
 [![Tested](https://img.shields.io/badge/Live%20Tested-93.6%25-green.svg)](docs/reference/api-coverage.md#test-results)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-18.5+-darkred.svg)](https://www.blackmagicdesign.com/products/davinciresolve)
@@ -152,7 +152,7 @@ self-healing.
 | Mode | Entry point | Tools | Best for |
 |------|-------------|-------|----------|
 | Compound | `src/server.py` | 37 | Default mode for most assistants. Related Resolve operations are grouped behind action parameters to keep context usage low. |
-| Full / granular | `src/server.py --full` or `src/resolve_mcp_server.py` | 387 | Power users who want one MCP tool per Resolve API method. |
+| Full / granular | `src/server.py --full` or `src/resolve_mcp_server.py` | 389 | Power users who want one MCP tool per Resolve API method. |
 
 The compound server is recommended unless you specifically need the granular one-tool-per-method surface.
 
@@ -423,13 +423,13 @@ This project treats camera originals and source media as immutable. Analysis too
 
 ## Security Posture
 
-The default server is a local stdio process launched by your MCP client; it does not expose a network listener or built-in multi-user auth surface. The two opt-in local HTTP surfaces — the control panel and the networked MCP transport — bind loopback only and require a per-launch bearer token on every request, with Host/Origin checks against DNS rebinding and CSRF. Tool metadata includes MCP client-safety hints for read-only, destructive, idempotent, and external-resource operations. See [Security Policy](SECURITY.md) for operational boundaries, confirmation guidance, and vulnerability reporting.
+The default server is a local stdio process launched by your MCP client; it does not expose a network listener or built-in multi-user auth surface. The two opt-in local HTTP surfaces — the control panel and the networked MCP transport — bind loopback only and require a per-launch bearer token on every request, with Host/Origin checks against DNS rebinding and CSRF. Tool metadata includes MCP client-safety hints for read-only, destructive, idempotent, and external-resource operations. Destructive writes on both servers honour `destructive.safe_mode` and the security audit log; only the compound server archives a timeline before mutating it — granular writes are refused or recorded, never recovered. See [Security Policy](SECURITY.md) for operational boundaries, confirmation guidance, and vulnerability reporting.
 
 ## Key Stats
 
 | Metric | Value |
 |--------|-------|
-| MCP Tools | **37** compound / **387** granular (live server) |
+| MCP Tools | **37** compound / **389** granular (live server) |
 | Advanced (offline) tools | **18** — .drp/.drt/.drx + DB authoring, no Resolve running |
 | Kernel Actions | **136** guarded workflow actions across 9 compound tools |
 | API Methods Covered | **361/361** (100%) |

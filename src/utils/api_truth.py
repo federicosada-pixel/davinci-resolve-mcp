@@ -3373,6 +3373,101 @@ API_TRUTH: List[Dict[str, Any]] = [
                        "second contributor. The current-timeline pointer moved to "
                        "the duplicate, and SetCurrentTimeline put it back.",
     },
+    {
+        "symbol": "ProjectManager.ArchiveProject",
+        "object": "ProjectManager",
+        "signature": "(projectName, filePath, isArchiveSrcMedia=True, isArchiveRenderCache=True, isArchiveProxyMedia=False) -> bool",
+        "reality": "No scriptable call produces an archive. With source media and "
+                   "proxies off it returns False instantly and writes nothing, for an "
+                   "open or a closed project and with render cache on or off. With "
+                   "isArchiveSrcMedia or isArchiveProxyMedia on it creates an empty "
+                   "directory at the target and Resolve crashes (SIGSEGV) in the same "
+                   "second; the call comes back through the bridge as None and every "
+                   "later handle is dead. Four crashes, one of them in a Blackmagic "
+                   "Cloud library, share identical top stack frames in Fusion "
+                   "script-symbol teardown on the UI thread; a separate crash in the "
+                   "same session during DeleteProject/LoadProject had a different "
+                   "stack, so the signature belongs to the archive calls. Media-flag "
+                   "calls crashed 4 of 4, flags-off calls 0 of 5. A file already at the "
+                   "target survived every case byte for byte, including a crash, so "
+                   "the destination is never overwritten; unsaved work in the open "
+                   "project is what is lost. The native defaults turn source media on, "
+                   "so a default call crashes Resolve. Resolve logs nothing about the "
+                   "False returns.",
+        "recommended": "Keep isArchiveSrcMedia and isArchiveProxyMedia off unless you "
+                       "have verified the build, and save every open project first. "
+                       "Treat False as 'nothing archived', not as a path problem: a "
+                       ".dra and a folder-style path fail identically. Archive from "
+                       "the Project Manager UI when you need a real archive.",
+        "tags": ["crash", "unreliable-return", "silent-failure", "project", "reported"],
+        "submit": "bug",
+        "verified_on": "DaVinci Resolve Studio 21.1.0.14",
+        "measured": "2026-09-14 on a disposable local project with one synthetic "
+                    "clip, one isolated call per case: all flags off (open project) "
+                    "False; all off (closed) False; render cache only False; source "
+                    "media None + crash + empty dir; proxy media None + crash + empty "
+                    "dir; unrelated file at target with flags off False, file "
+                    "byte-identical; populated directory at target with flags off "
+                    "False, untouched; source media onto an existing file None + "
+                    "crash, file byte-identical. 19.1.3.7 (mode matrix 2026-08-02, "
+                    "GUI and headless): False for .dra and folder paths, flags off.",
+        "mitigation": ["project_manager.archive", "project_manager.safe_project_archive",
+                       "archive_project"],
+    },
+    {
+        "symbol": "Tool.AddModifier",
+        "object": "Fusion Tool",
+        "signature": "(inputName, modifierRegID) -> bool",
+        "reality": "The second argument is the modifier's REGISTRY ID, not its "
+                   "display name. On a TextPlus StyledText input, "
+                   "AddModifier('StyledText', 'Follower') and 'TextFollower' return "
+                   "False and attach nothing; 'StyledTextFollower' returns True, "
+                   "creates a tool named Follower1 of that ID and connects it to the "
+                   "input. Spline modifiers already go by registry ID (BezierSpline, "
+                   "Path). Through the Lua bridge the bool is not reliable evidence; "
+                   "the input's connected-output readback is.",
+        "recommended": "Pass the registry ID. fusion_comp add_modifier maps 'Follower' "
+                       "to 'StyledTextFollower', verifies by readback and returns the "
+                       "created modifier tool so it can be driven with set_input / "
+                       "add_keyframe (Delay for a per-character stagger).",
+        "tags": ["fusion", "naming", "silent-failure"],
+        "verified_on": "DaVinci Resolve Studio 19.1.3.7",
+        "measured": "2026-09-19 on a disposable timeline: "
+                    "InsertFusionCompositionIntoTimeline, AddTool('TextPlus'), then "
+                    "AddModifier('StyledText', X) for X in Follower / "
+                    "StyledTextFollower / TextFollower, with a GetToolList diff and "
+                    "StyledText.GetConnectedOutput().GetTool() readback after each; "
+                    "only StyledTextFollower attached (new tool Follower1).",
+        "mitigation": ["fusion_comp.add_modifier", "fusion_comp.add_keyframe"],
+    },
+    {
+        "symbol": "Tool.AddModifier (NestControl inputs)",
+        "object": "Fusion Tool",
+        "signature": "(inputName, modifierRegID) -> bool",
+        "reality": "Some inputs GetInputList() returns are not values at all: those whose "
+                   "INPID_InputControl attribute is 'NestControl' (INPB_Passive true) are "
+                   "the fold-down group headers the Fusion UI draws. AddModifier returns "
+                   "False for them on every modifier type, and assigning at a time sets "
+                   "nothing. Measured on TextPlus Softness1 and on the text Follower's "
+                   "TransformSize, Softness1 and Size1. The controls a header folds are "
+                   "the next INPI_LabelControl_NumInputs entries in GetInputList() order "
+                   "(Softness1 -> SoftnessX1, SoftnessY1, SoftnessOnFillColorToo1, "
+                   "SoftnessGlow1, SoftnessBlend1; TransformSize -> Line/Word/Character "
+                   "Size X and Y), and those take a BezierSpline normally.",
+        "recommended": "Keyframe the folded controls, never the header. fusion_comp "
+                       "add_keyframe and add_modifier refuse a nest control with "
+                       "FUSION_INPUT_IS_NEST_CONTROL and list its members.",
+        "tags": ["fusion", "silent-failure", "naming"],
+        "verified_on": "DaVinci Resolve Studio 19.1.3.7",
+        "measured": "2026-09-19 on a disposable timeline: Follower via add_modifier, then "
+                    "add_keyframe on TransformSize / Softness1 (FUSION_ADD_MODIFIER_FAILED, "
+                    "raw AddModifier False for BezierSpline, Path, TextScramble) versus "
+                    "Size / Opacity1 / Delay / SoftnessX1 / SoftnessY1 / SizeX1 / "
+                    "CharacterSizeX (BezierSpline attached); TextPlus Softness1 refused too. "
+                    "GetAttrs diff: INPID_InputControl NestControl vs SliderControl, "
+                    "INPB_Passive true, INPI_LabelControl_NumInputs 6 / 5 / 2.",
+        "mitigation": ["fusion_comp.add_keyframe", "fusion_comp.add_modifier"],
+    },
 
 ]
 
@@ -3432,6 +3527,10 @@ ACTION_SYMBOLS: Dict[Tuple[str, str], List[str]] = {
     ("timeline_item_color", "export_lut"): ["TimelineItem.ExportLUT"],
     ("timeline_item_color", "safe_export_lut"): ["TimelineItem.ExportLUT"],
     ("timeline", "duplicate"): ["Timeline.DuplicateTimeline"],
+    ("project_manager", "archive"): ["ProjectManager.ArchiveProject"],
+    ("fusion_comp", "add_modifier"): ["Tool.AddModifier", "Tool.AddModifier (NestControl inputs)"],
+    ("fusion_comp", "add_keyframe"): ["Tool.AddModifier (NestControl inputs)"],
+    ("project_manager", "safe_project_archive"): ["ProjectManager.ArchiveProject"],
 }
 
 

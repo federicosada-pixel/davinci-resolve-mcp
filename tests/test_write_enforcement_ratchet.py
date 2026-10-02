@@ -20,6 +20,33 @@ This file makes the three failure modes structural:
 Actions are discovered from literal `action == "x"` / `action in {...}`
 comparisons in each @mcp.tool function, the same shape the action-list drift
 guard trusts. "Write-style" is a name heuristic — a ratchet, not a proof.
+
+Both servers are covered, by different means, because they are built differently.
+
+The COMPOUND server (`src/server.py`) dispatches `(tool, action)` pairs through
+`@_destructive_op`, so a rating can be checked against a real enforcement hook —
+that is the first three tests.
+
+The GRANULAR server (`src/granular/`) has one function per tool and no `action`
+argument, so `@_destructive_op` — which wraps `(action, params)` — cannot apply.
+For four releases it had no enforcement hook at all, which is how `ti_copy_grades`
+reached `TimelineItem.CopyGrades`, an API that replaces a node graph with no
+recovery version, behind no guard of any kind (v4.3.0). Since v4.5.0 every
+destructive-hinted granular tool carries `@granular_destructive_op()`: safe-mode
+refusal plus an audit row, and NO archive — a granular write stays unrecoverable.
+
+Two tiers, kept separate on purpose, because enforcement and confirmation are
+different things (the compound server registers 148 destructive actions and has
+24 confirm-token sites):
+
+  * ENFORCEMENT — every destructive-hinted tool must carry the hook, placed INSIDE
+    `@mcp.tool` so the schema FastMCP reads is the wrapper's. The backlog of
+    unhooked tools is frozen at empty; a new destructive tool without the hook
+    fails the suite.
+  * CONFIRMATION — a tool that calls a symbol the ledger marks `destroys_prior_work`
+    must ALSO ask twice: `acknowledge_trap` plus a confirm token bound to the
+    resolved targets, and it takes HIGH from the ledger rather than from its verb.
+    The enforcement hook does not satisfy this test, and must not.
 """
 
 from __future__ import annotations
@@ -29,10 +56,13 @@ import re
 import unittest
 from pathlib import Path
 
+from src.granular.common import _annotations_for_tool_name
 from src.utils import destructive_hook
-from src.utils.execution_lifecycle import RiskClassificationHook, classify_operation_risk
+from src.utils.api_truth import API_TRUTH
+from src.utils.execution_lifecycle import RiskClassificationHook, RiskLevel, classify_operation_risk
 
 SERVER = Path(__file__).resolve().parents[1] / "src" / "server.py"
+GRANULAR = Path(__file__).resolve().parents[1] / "src" / "granular"
 RISK_TABLES = ("_CRITICAL_ACTIONS", "_HIGH_RISK_ACTIONS", "_MEDIUM_RISK_ACTIONS",
                "_LOW_RISK_ACTIONS", "_GRAPH_LUT_ACTIONS")
 WRITE_STYLE = re.compile(
@@ -112,12 +142,10 @@ UNRATED_WRITE_BACKLOG = frozenset({
     "media_storage.add_timeline_mattes",
     "media_storage.import_to_pool",
     "project_manager.apply_spec",
-    "project_manager.archive",
     "project_manager.create",
     "project_manager.import_project",
     "project_manager.load",
     "project_manager.restore",
-    "project_manager.safe_project_archive",
     "project_manager.safe_project_create",
     "project_manager.safe_project_export",
     "project_manager.safe_project_import",
@@ -261,6 +289,199 @@ class WriteEnforcementRatchetTest(unittest.TestCase):
         list, so the list can only get shorter."""
         stale = sorted(UNRATED_WRITE_BACKLOG - self._unrated())
         self.assertEqual(stale, [], "these are rated or registered now — remove them from the backlog")
+
+
+
+# ── Granular server ──────────────────────────────────────────────────────────
+
+#: Method names the ledger says destroy work that cannot be recovered. Derived from
+#: API_TRUTH rather than written out, so flagging a new entry extends this guard
+#: without anyone remembering to come back here.
+TRAP_METHODS = frozenset(
+    entry["symbol"].rsplit(".", 1)[-1]
+    for entry in API_TRUTH
+    if entry.get("destroys_prior_work")
+)
+
+#: Granular tools hinted destructive with no enforcement hook in front of them.
+#: Emptied in v4.5.0 — it held 131 entries at v4.4.1. It stays declared so that the
+#: two ratchet tests keep their shape: a new destructive-hinted tool that skips the
+#: hook fails `test_no_new_ungated_destructive_granular_tool`, and anything added
+#: here must come with a written reason and comes off again the moment it is hooked.
+UNGATED_GRANULAR_DESTRUCTIVE: frozenset = frozenset()
+
+
+def _granular_tools():
+    """{tool: (annotation_or_None, called_methods, gated)} for every granular tool."""
+    out = {}
+    for path in sorted(GRANULAR.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in tree.body:
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            decorators = [d for d in fn.decorator_list
+                          if isinstance(d, ast.Call) and getattr(d.func, "attr", "") == "tool"]
+            if not decorators:
+                continue
+            explicit = None
+            for d in decorators:
+                for kw in d.keywords:
+                    if kw.arg == "annotations":
+                        explicit = ast.unparse(kw.value)
+            called = {n.func.attr for n in ast.walk(fn)
+                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                      and n.func.attr and n.func.attr[0].isupper()}
+            # Gated means the two halves are really there, checked as calls and
+            # parameters rather than as substrings: an earlier version of this guard
+            # looked for the text "CONFIRM_TOKENS", and deleting the redemption while
+            # leaving the issuance behind still read as gated. Issuing a token nobody
+            # checks is exactly the failure worth catching.
+            confirm_calls = {n.func.attr for n in ast.walk(fn)
+                             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                             and isinstance(n.func.value, ast.Name)
+                             and n.func.value.id == "CONFIRM_TOKENS"}
+            params = {a.arg for a in fn.args.args} | {a.arg for a in fn.args.kwonlyargs}
+            gated = ({"issue", "consume"} <= confirm_calls
+                     and "acknowledge_trap" in params
+                     and "confirm_token" in params)
+            # The enforcement hook, as a decorator CALL by name — a bare reference
+            # `@granular_destructive_op` (no parentheses) would wrap the tool in the
+            # decorator factory and register a tool that does nothing.
+            hook_positions = [i for i, d in enumerate(fn.decorator_list)
+                              if isinstance(d, ast.Call)
+                              and isinstance(d.func, ast.Name)
+                              and d.func.id == "granular_destructive_op"]
+            tool_positions = [i for i, d in enumerate(fn.decorator_list)
+                              if isinstance(d, ast.Call) and getattr(d.func, "attr", "") == "tool"]
+            enforced = bool(hook_positions)
+            # Decorators apply bottom-up: a lower index is the OUTER wrapper. The hook
+            # must sit below @mcp.tool so FastMCP registers the wrapper (and its
+            # `allow_risky_operation` parameter), not the bare function.
+            hook_inside = enforced and all(h > t for h in hook_positions for t in tool_positions)
+            out[fn.name] = (explicit, called, gated, enforced, hook_inside)
+    return out
+
+
+def _live_tool(name: str):
+    """The registered function object for a granular tool, hook and all."""
+    import importlib
+    for path in sorted(GRANULAR.glob("*.py")):
+        if path.stem.startswith("__"):
+            continue
+        module = importlib.import_module(f"src.granular.{path.stem}")
+        fn = getattr(module, name, None)
+        # Star imports carry every name everywhere; only the defining module counts.
+        if callable(fn) and getattr(fn, "__module__", None) == module.__name__:
+            return fn
+    raise AssertionError(f"no granular module defines {name}")
+
+
+def _is_destructive(tool: str, explicit) -> bool:
+    if explicit is not None:
+        return explicit == "DESTRUCTIVE_TOOL"
+    return _annotations_for_tool_name(tool).destructiveHint
+
+
+class GranularWriteEnforcementTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tools = _granular_tools()
+
+    def test_every_trap_symbol_call_is_gated(self) -> None:
+        """The one enforcement claim on this surface, and the one that matters.
+
+        `TimelineItem.CopyGrades` replaces a grade with no version to restore, and
+        the granular twin called it with no acknowledgement and no confirmation.
+        A tool reaching a `destroys_prior_work` symbol must ask twice: the trap
+        acknowledgement, then a confirm token bound to the resolved targets.
+        """
+        self.assertTrue(TRAP_METHODS, "no destroys_prior_work entries — guard is vacuous")
+        ungated = [f"{tool} calls {sorted(called & TRAP_METHODS)}"
+                   for tool, (_explicit, called, gated, _enforced, _inside) in sorted(self.tools.items())
+                   if (called & TRAP_METHODS) and not gated]
+        self.assertEqual(ungated, [], "granular tools reaching an unrecoverable API "
+                                      "with no acknowledge_trap + confirm_token gate")
+
+    def test_trap_symbol_tools_are_hinted_destructive(self) -> None:
+        """A gate the caller only meets after calling is half a gate.
+
+        A client that refuses destructive tools should never reach the confirmation
+        at all, so the hint has to agree with the gate.
+        """
+        mismatched = [tool for tool, (explicit, called, _gated, _enforced, _inside) in sorted(self.tools.items())
+                      if (called & TRAP_METHODS) and not _is_destructive(tool, explicit)]
+        self.assertEqual(mismatched, [], "reaches an unrecoverable API but is not "
+                                         "hinted destructive")
+
+    def test_trap_symbol_tools_take_high_from_the_ledger(self) -> None:
+        """The one hand-rating refinement, made mechanical.
+
+        `ti_copy_grades` rates MEDIUM by verb (`copy` is in no table). The ledger
+        says the API it reaches destroys prior work, so the hook rates it HIGH from
+        the ledger — and safe mode refuses it. A trap tool must also carry the hook
+        at all: a confirm token asks the caller, the hook asks the policy.
+        """
+        for tool, (_explicit, called, _gated, enforced, _inside) in sorted(self.tools.items()):
+            if not (called & TRAP_METHODS):
+                continue
+            with self.subTest(tool=tool):
+                self.assertTrue(enforced, f"{tool} reaches a trap symbol but has no hook")
+                live = _live_tool(tool)
+                _action, level = live.__granular_destructive__
+                self.assertEqual(level, RiskLevel.HIGH.value)
+                self.assertEqual(destructive_hook.granular_risk_level(tool, live.__wrapped__),
+                                 RiskLevel.HIGH.value)
+                self.assertIn(level, destructive_hook.SAFE_MODE_BLOCKED_RISK_LEVELS)
+
+    def test_enforcement_hook_sits_inside_mcp_tool(self) -> None:
+        """`@mcp.tool()` outermost, `@granular_destructive_op()` inner.
+
+        The other way round FastMCP registers the bare function: no refusal, no
+        audit row, no override parameter — and every static count still reads as
+        hooked. Order is the whole difference between enforced and decorated.
+        """
+        wrong = sorted(tool for tool, (_e, _c, _g, enforced, inside) in self.tools.items()
+                       if enforced and not inside)
+        self.assertEqual(wrong, [], "hook placed outside @mcp.tool — it wraps nothing "
+                                    "FastMCP registers")
+
+    def test_every_hooked_tool_rates_a_level_safe_mode_can_read(self) -> None:
+        """The casing bug, pinned. The first draft rated verbs "HIGH" while the gate
+        holds `RiskLevel.HIGH.value == "high"`; nothing matched and safe mode was
+        cosmetic on every hooked tool."""
+        valid = {level.value for level in RiskLevel}
+        bad = []
+        for tool, (_e, _c, _g, enforced, _i) in sorted(self.tools.items()):
+            if not enforced:
+                continue
+            _action, level = _live_tool(tool).__granular_destructive__
+            if level not in valid:
+                bad.append(f"{tool}={level!r}")
+        self.assertEqual(bad, [], "risk levels that are not RiskLevel values")
+        self.assertTrue(set(destructive_hook.GRANULAR_RISK_BY_VERB.values()) <= valid)
+
+    def _ungated_destructive(self) -> set:
+        return {tool for tool, (explicit, _called, _gated, enforced, _inside) in self.tools.items()
+                if _is_destructive(tool, explicit) and not enforced}
+
+    def test_no_new_ungated_destructive_granular_tool(self) -> None:
+        new = sorted(self._ungated_destructive() - UNGATED_GRANULAR_DESTRUCTIVE)
+        self.assertEqual(new, [], "destructive granular tool with no enforcement hook — "
+                                  "add @granular_destructive_op() inside @mcp.tool(), or "
+                                  "add it to the backlog with a reason")
+
+    def test_hooked_tools_are_exactly_the_destructive_hinted_ones(self) -> None:
+        """The hook is not free — it adds a parameter and an audit row — so a plain
+        write or a reader must not carry it either."""
+        extra = sorted(tool for tool, (explicit, _c, _g, enforced, _i) in self.tools.items()
+                       if enforced and not _is_destructive(tool, explicit))
+        self.assertEqual(extra, [], "hooked but not hinted destructive")
+
+    def test_the_granular_backlog_has_no_stale_entries(self) -> None:
+        """The ratchet: hooking a tool takes it off the list, so the list only shrinks."""
+        stale = sorted(UNGATED_GRANULAR_DESTRUCTIVE - self._ungated_destructive())
+        self.assertEqual(stale, [], "these are gated now — remove them from the backlog")
+
 
 
 if __name__ == "__main__":
