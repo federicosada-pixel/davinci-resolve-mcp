@@ -12,7 +12,7 @@
   <key>RunAtLoad</key><false/>
   <key>LowPriorityIO</key><true/>
   <key>Nice</key><integer>10</integer>
-  <key>StandardOutPath</key><string>@SCRIPT_DIR@/data/launchd.out.log</string>
-  <key>StandardErrorPath</key><string>@SCRIPT_DIR@/data/launchd.err.log</string>
+  <key>StandardOutPath</key><string>@LOG_DIR@/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>@LOG_DIR@/launchd.err.log</string>
 </dict>
 </plist>

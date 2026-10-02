@@ -207,13 +207,25 @@ class Index:
 
 
 def rank(cands, ref):
-    """Rank exact-name hits by lexicographic recovery priority."""
+    """Rank exact-name hits by lexicographic recovery priority.
+
+    When the Live Set recorded a size for the reference AND at least one
+    candidate matches that size, candidates whose size differs are dropped
+    outright — path similarity must never win over a confirmed byte-for-byte
+    size match. If no candidate matches (or size is unknown), fall back to
+    the full lexicographic ranking across all candidates.
+    """
     orig = ref["path"] or ref["relative_path"]
     orig_parts = [x.lower() for x in orig.split("/") if x][:-1]
     orig_vol = orig.split("/")[2] if orig.startswith("/Volumes/") else "Macintosh HD"
+    orig_size = ref["orig_size"]
+    if orig_size:
+        size_hits = [c for c in cands if c[1] == orig_size]
+        if size_hits:
+            cands = size_hits
     scored = []
     for path, size, volume, in_backup in cands:
-        size_match = bool(ref["orig_size"] and size == ref["orig_size"])
+        size_match = bool(orig_size and size == orig_size)
         parts = [x.lower() for x in path.split("/") if x][:-1]
         n = 0
         while n < min(len(parts), len(orig_parts)) and parts[-1 - n] == orig_parts[-1 - n]:
@@ -387,10 +399,13 @@ def write_outputs(results, index, out_dir: Path, scope):
                 continue
             seen_targets.add(m["target"])
             flag = "" if m["size_match"] or not m["orig_size"] else "   # size differs from original, verify"
-            block.append(f'restore {sh(m["best_match"])} {sh(m["target"])}{flag}')
+            try:
+                block.append(f'restore {sh(m["best_match"])} {sh(m["target"])}{flag}')
+            except ValueError as e:
+                # Skip and log — a single corrupt reference must not poison the whole script.
+                print(f"warn: {e}", file=sys.stderr)
         if block:
-            set_comment = r["set"].replace("\r", " ").replace("\n", " ")
-            lines.append(f"# === {set_comment}")
+            lines.append(f"# === {sanitize_comment(r['set'])}")
             lines += block + [""]
     lines += ['echo "targets: $n  copied: $done_  skipped(existing/gone): $skipped"',
               '[ "$APPLY" = 1 ] || echo "dry run only. Re-run with --apply to copy."']
@@ -485,7 +500,26 @@ def write_outputs(results, index, out_dir: Path, scope):
 
 
 def sh(s: str) -> str:
+    """POSIX single-quote a string for safe inclusion in the restore script.
+
+    Rejects embedded NUL and newline characters — macOS permits newlines in
+    filenames, but a newline inside a restore line would split a single
+    `restore <src> <dst>` command across lines in a way that is at best
+    confusing to a human reviewer and at worst exploitable if the filename
+    is attacker-controlled (a crafted .als could register a reference whose
+    path contains `\\n rm -rf ~`). Rather than silently paper over such input,
+    fail fast with a diagnostic so the operator can inspect the Live Set.
+    """
+    if "\x00" in s or "\n" in s or "\r" in s:
+        raise ValueError(
+            f"refusing to shell-quote path containing control character: {s!r}"
+        )
     return "'" + s.replace("'", "'\\''") + "'"
+
+
+def sanitize_comment(s: str) -> str:
+    """Collapse control characters so a set name is safe inside a `#` comment."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", s).strip() or "(unnamed set)"
 
 
 def main():

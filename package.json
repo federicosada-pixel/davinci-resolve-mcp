@@ -54,6 +54,11 @@
   ],
   "scripts": {
     "files:analyze": "python3 tools/file-analyzer/analyze.py",
+    "ableton:index": "python3 tools/ableton-recovery/index_files.py",
+    "ableton:scan": "python3 tools/ableton-recovery/scan_sets.py",
+    "ableton:recovery": "bash tools/ableton-recovery/run_recovery.sh",
+    "ableton:recovery:install": "bash tools/ableton-recovery/install_launchd.sh",
+    "ableton:recovery:uninstall": "bash tools/ableton-recovery/uninstall_launchd.sh",
     "smoke": "node bin/davinci-resolve-mcp.mjs --help && node bin/davinci-resolve-mcp.mjs --version",
     "pack:check": "npm pack --dry-run"
   },

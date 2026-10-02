@@ -41,13 +41,19 @@ SF_DATALESS = 0x40000000
 
 ALL_FILE_EXT = AUDIO_EXT | LIVE_EXT | MIDI_EXT | PRESET_EXT | INSTALLER_EXT | MAXPATCH_EXT
 
+# Directories we always skip, regardless of location. "Mobile Documents" and
+# "Google" are deliberately NOT in this set: legacy iCloud Drive lives at
+# ~/Library/Mobile Documents/ and Google Drive File Provider mounts appear
+# under ~/Library/CloudStorage/GoogleDrive-*. Skipping those by name hid
+# recoverable Live Sets stored in the cloud. ~/Library/Google (Chrome data)
+# is pruned by the --root scope, not by name.
 SKIP_DIR_NAMES = {
     "node_modules", ".git", ".svn", "__pycache__", ".Trash", ".Trashes",
     ".Spotlight-V100", ".fseventsd", ".TemporaryItems", ".DocumentRevisions-V100",
     "System Volume Information", "Caches", "com.apple.bird",
     "Xcode", "DerivedData", "Containers", "Group Containers", "Mail",
     "Messages", "Photos Library.photoslibrary", "Photo Booth Library",
-    "Safari", "Google", "Mobile Documents",
+    "Safari",
 }
 
 DEFAULT_ROOTS = [
@@ -57,7 +63,12 @@ DEFAULT_ROOTS = [
     HOME / "Downloads",
     HOME / "Movies",
     HOME / "Dropbox",
+    # macOS File Provider mounts (iCloud Drive, Dropbox, Google Drive, OneDrive,
+    # Box) land under CloudStorage. The legacy iCloud Drive path is Mobile
+    # Documents; include both so a Live Set stored only in the cloud is still
+    # reachable from the recovery index.
     HOME / "Library" / "CloudStorage",
+    HOME / "Library" / "Mobile Documents",
     HOME / "Library" / "Audio",
     HOME / "Library" / "Application Support",
     Path("/Users/Shared"),

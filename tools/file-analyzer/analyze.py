@@ -765,11 +765,20 @@ class Scanner:
                 if is_litter(name):
                     self.litter.append(rec)
                     continue
-                if st.st_size == 0:
-                    self.stats.empty_files += 1
-                    continue
-                if st.st_size < self.min_size:
-                    continue
+                # Dataless (iCloud-offloaded) files report st_size as the
+                # logical size on-disk, which can look like 0 or a stub well
+                # below --min-size. Dropping them here would silently exclude
+                # them from manifest verification and from the duplicate-set
+                # protection logic further down, which is the exact wrong
+                # outcome: a file we cannot see must stay visible to the
+                # protection code so we never pick a materialised sibling as
+                # the "keeper" on the strength of a size filter alone.
+                if not dataless:
+                    if st.st_size == 0:
+                        self.stats.empty_files += 1
+                        continue
+                    if st.st_size < self.min_size:
+                        continue
                 self.files.append(rec)
                 self._progress()
         self._progress(force=True)
@@ -923,17 +932,27 @@ class ManifestResult:
 
 
 def load_manifest(root: str, manifest_path: Optional[str]) -> Optional[Tuple[str, Dict[str, dict]]]:
+    """Return (path, entries) for a usable manifest, or None.
+
+    When the caller explicitly passed `manifest_path`, failure to load it is
+    an error, not a silent skip — a missing, unparseable, or structurally
+    empty manifest in that case raises instead of degrading to "no manifest",
+    so the analyzer never processes files thinking it has protection it
+    doesn't. When no manifest was requested and the default lookup turns up
+    nothing usable, we return None.
+    """
     cand = manifest_path or os.path.join(root, "manifest.json")
+    explicit = manifest_path is not None
     if not os.path.isfile(cand):
-        if manifest_path:
+        if explicit:
             raise FileNotFoundError(f"manifest not found: {cand}")
         return None
     try:
         with open(cand, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, ValueError):
-        if manifest_path:
-            raise
+    except (OSError, ValueError) as e:
+        if explicit:
+            raise ValueError(f"manifest {cand}: {e}") from e
         return None
     entries: Dict[str, dict] = {}
     items = data.get("files", data) if isinstance(data, dict) else data
@@ -947,6 +966,13 @@ def load_manifest(root: str, manifest_path: Optional[str]) -> Optional[Tuple[str
                 entries[k] = dict(v, path=k)
             elif isinstance(v, str):
                 entries[k] = {"path": k, "sha256": v}
+    if not entries:
+        if explicit:
+            raise ValueError(
+                f"manifest {cand}: parsed successfully but contains no file "
+                "entries (expected a top-level 'files' list, or a path->record map)"
+            )
+        return None
     return cand, entries
 
 
