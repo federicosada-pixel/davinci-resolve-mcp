@@ -564,3 +564,89 @@ test('assemble_project folders: bins register in the parent folder blob (E86/E87
   assert.ok(bin.includes('<FieldsBlob/>'), 'the bin itself carries an empty blob (native-export convention)');
   await fs.unlink(out);
 });
+
+test('assemble_project folders: the registry names every bin, not just the first one (protobuf varint)', async () => {
+  // The registry is `protobuf{field2: keyedDict{"<i>": binId}, field4: time}`
+  // and field 2's length is a VARINT. One bin's dict is 95 bytes, which a
+  // single byte can carry; two bins' is 182, which it cannot — `[0x12, 182]`
+  // wrote 0xb6, whose continuation bit swallowed the dict's first byte and
+  // read back as length 54. The blob then parsed to an empty registry with
+  // neither bin in it, while the archive carried both bin directories.
+  const requireC7 = createRequire(import.meta.url);
+  const { decodeKeyedDict, encodeKeyedDict } = requireC7('../vendor/drp-format/keyed-dict.js');
+  const out = tmp('.drp');
+  const spec = (name, folder) => ({ timelineName: name, folder, media: [{
+    mediaFilePath: '/m/a.mp4', spec: { width: 640, height: 360, frameCount: 480, fps: 24 },
+    cuts: [{ startFrame: 86400, durationFrames: 48 }] }] });
+  await drtTool.handler({ action: 'assemble_project', args: {
+    outputPath: out, targetAppVersion: '21.1',
+    timelines: [spec('R1', 'Reel 1'), spec('R2', 'Reel 2')],
+  }});
+  const zip = await JSZip.loadAsync(await fs.readFile(out));
+  const binIds = [];
+  for (const entry of Object.keys(zip.files)) {
+    if (!/^MediaPool\/Master\/[^/]+\/MpFolder\.xml$/.test(entry)) continue;
+    binIds.push((await zip.file(entry).async('string')).match(/<Sm2MpFolder DbId="([^"]+)"/)[1]);
+  }
+  assert.equal(binIds.length, 2, 'both bin directories are in the archive');
+
+  const master = await zip.file('MediaPool/Master/MpFolder.xml').async('string');
+  const raw = Buffer.from(master.match(/<Sm2MpFolder DbId="[^"]+">\s*<FieldsBlob>([0-9a-fA-F]+)<\/FieldsBlob>/)[1], 'hex');
+  // [u32 2][u32 len][0x81][zstd single-segment frame, one RAW block]
+  const zf = raw.subarray(9);
+  const fhd = zf[4];
+  let o = 5 + [1, 2, 4, 8][fhd >> 6];
+  const bh = zf.readUIntLE(o, 3); o += 3;
+  assert.equal((bh >> 1) & 3, 0, 'raw zstd block');
+  const inner = zf.subarray(o, o + (bh >> 3));
+
+  assert.equal(inner[0], 0x12, 'field 2, length-delimited');
+  let i = 1, len = 0, shift = 0;
+  for (;;) { const b = inner[i++]; len |= (b & 0x7f) << shift; if (!(b & 0x80)) break; shift += 7; }
+  const dict = inner.subarray(i, i + len);
+  const parsed = decodeKeyedDict(dict);
+  assert.ok(encodeKeyedDict(parsed).equals(dict), 'the declared length covers exactly the keyed dict');
+  assert.equal(parsed.entries.length, 2, 'both bins registered');
+  assert.deepEqual(parsed.entries.map((e) => e.value).sort(), [...binIds].sort());
+  // field 4 (the time varint) still follows the dict and nothing dangles.
+  assert.equal(inner[i + len], 0x20, 'field 4 begins right after field 2');
+  await fs.unlink(out);
+});
+
+test('assemble_project folders: a timeline whose name needs xml escaping still reaches its bin', async () => {
+  // The pool clip carries the name escaped (createEmptyProject/addMediaClip run it
+  // through escapeXml), so the lookup that moves the clip into its bin has to match
+  // `Reel 1 &amp; 2`. Matching the raw `Reel 1 & 2` found nothing and the whole call
+  // threw "could not locate pool clip for timeline Reel 1 & 2".
+  const out = tmp('.drp');
+  const spec = (name, folder) => ({ timelineName: name, folder, media: [{
+    mediaFilePath: '/m/a.mp4', spec: { width: 640, height: 360, frameCount: 480, fps: 24 },
+    cuts: [{ startFrame: 86400, durationFrames: 48 }] }] });
+  await drtTool.handler({ action: 'assemble_project', args: {
+    outputPath: out, targetAppVersion: '21.1',
+    timelines: [spec('Reel 1 & 2', 'Reels'), spec('Reel 3', 'Reels')],
+  }});
+  const zip = await JSZip.loadAsync(await fs.readFile(out));
+  const bin = await zip.file('MediaPool/Master/Reels/MpFolder.xml').async('string');
+  assert.match(bin, /<Name>Reel 1 &amp; 2<\/Name>/, 'the escaped name moved into the bin');
+  const master = await zip.file('MediaPool/Master/MpFolder.xml').async('string');
+  assert.doesNotMatch(master, /<Name>Reel 1 &amp; 2<\/Name>/, 'and left Master');
+  await fs.unlink(out);
+});
+
+test('assemble_project folders: a bin name needing xml escaping produces well-formed xml', async () => {
+  const out = tmp('.drp');
+  const spec = (name) => ({ timelineName: name, folder: 'R&D', media: [{
+    mediaFilePath: '/m/a.mp4', spec: { width: 640, height: 360, frameCount: 480, fps: 24 },
+    cuts: [{ startFrame: 86400, durationFrames: 48 }] }] });
+  await drtTool.handler({ action: 'assemble_project', args: {
+    outputPath: out, targetAppVersion: '21.1',
+    timelines: [spec('R1'), spec('R2')],
+  }});
+  const zip = await JSZip.loadAsync(await fs.readFile(out));
+  const bin = await zip.file('MediaPool/Master/R&D/MpFolder.xml').async('string');
+  const { XMLValidator } = createRequire(import.meta.url)('fast-xml-parser');
+  assert.equal(XMLValidator.validate(bin), true, 'the bin folder xml parses');
+  assert.match(bin, /<Name>R&amp;D<\/Name>/);
+  await fs.unlink(out);
+});

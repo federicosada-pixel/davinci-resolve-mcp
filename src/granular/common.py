@@ -45,8 +45,6 @@ from src.utils.layout_presets import (
     export_layout_preset,
     import_layout_preset,
     list_layout_presets,
-    load_layout_preset,
-    save_layout_preset,
 )
 from src.utils.object_inspection import inspect_object, print_object_help
 from src.utils.platform import get_platform, get_resolve_paths
@@ -93,7 +91,7 @@ if not logging.getLogger().handlers:
         handlers=[logging.StreamHandler()],
     )
 
-VERSION = "4.8.20"
+VERSION = "4.10.6"
 logger = logging.getLogger("davinci-resolve-mcp")
 logger.info(f"Starting DaVinci Resolve MCP Server v{VERSION}")
 logger.info(f"Detected platform: {get_platform()}")
@@ -379,7 +377,10 @@ def _resolve_safe_dir(path):
         # silently into both, same as /var/folders (matches src/server.py).
         _is_sandbox = path.startswith(("/var/", "/private/var/", "/tmp/", "/private/tmp/")) or path in ("/tmp", "/private/tmp")
     elif platform.system() == "Linux":
-        _is_sandbox = path.startswith("/tmp") or path.startswith("/var/tmp")
+        # By segment, not by character prefix (matches src/server.py): a sibling
+        # of /tmp whose name merely begins with it — /tmpfiles, /tmp-scratch,
+        # /var/tmpdata — cleared `startswith("/tmp")` and was redirected.
+        _is_sandbox = path.startswith(("/tmp/", "/var/tmp/")) or path in ("/tmp", "/var/tmp")
     elif platform.system() == "Windows":
         try:
             _is_sandbox = os.path.commonpath([os.path.abspath(path), os.path.abspath(system_temp)]) == os.path.abspath(system_temp)
