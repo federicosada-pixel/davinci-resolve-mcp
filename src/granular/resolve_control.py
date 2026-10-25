@@ -262,7 +262,7 @@ def export_layout_preset_tool(preset_name: str, export_path: str) -> Dict[str, A
 
 
 @mcp.tool()
-def import_layout_preset_tool(import_path: str, preset_name: str = None) -> Dict[str, Any]:
+def import_layout_preset_tool(import_path: str, preset_name: Optional[str] = None) -> Dict[str, Any]:
     """Import a layout preset from a file.
 
     Calls Resolve.ImportLayoutPreset() to import a preset from disk.
@@ -371,32 +371,45 @@ def restart_app(wait_seconds: int = 5) -> str:
 
 @mcp.tool()
 def open_settings() -> str:
-    """Open the Project Settings dialog in DaVinci Resolve."""
+    """Open the Project Settings dialog in DaVinci Resolve.
+
+    Not available on any Resolve build measured so far: the scripting API has
+    no call that opens this dialog (Studio 19.1.3.7 measured; absent from the
+    21.1 typed API). The reply says so by name instead of a bare failure. To
+    read or change project settings use get_project_settings,
+    get_project_setting and set_project_setting.
+    """
     resolve = get_resolve()
     if resolve is None:
         return "Error: Not connected to DaVinci Resolve"
-    
+
     result = open_project_settings(resolve)
-    
-    if result:
+    if result["success"]:
         return "Project Settings dialog opened successfully"
-    else:
-        return "Failed to open Project Settings dialog"
+    if not result["supported"]:
+        return (
+            result["message"]
+            + " Use get_project_settings, get_project_setting and set_project_setting instead."
+        )
+    return result["message"]
 
 
 @mcp.tool()
 def open_app_preferences() -> str:
-    """Open the Preferences dialog in DaVinci Resolve."""
+    """Open the Preferences dialog in DaVinci Resolve.
+
+    Not available on any Resolve build measured so far: the scripting API has
+    no call that opens this dialog (Studio 19.1.3.7 measured; absent from the
+    21.1 typed API). The reply says so by name instead of a bare failure.
+    """
     resolve = get_resolve()
     if resolve is None:
         return "Error: Not connected to DaVinci Resolve"
-    
+
     result = open_preferences(resolve)
-    
-    if result:
+    if result["success"]:
         return "Preferences dialog opened successfully"
-    else:
-        return "Failed to open Preferences dialog"
+    return result["message"]
 
 
 @mcp.tool()
@@ -688,7 +701,7 @@ def delete_user_preferences_preset(preset_name: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def import_user_preferences_preset(import_path: str, preset_name: str = None) -> Dict[str, Any]:
+def import_user_preferences_preset(import_path: str, preset_name: Optional[str] = None) -> Dict[str, Any]:
     """Import a user-preferences preset from a file (Resolve 21.0.4+).
 
     The imported preset is NOT auto-loaded; it takes its name from the file

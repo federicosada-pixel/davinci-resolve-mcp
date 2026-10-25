@@ -418,6 +418,14 @@ Operating rules an agent must know:
   `iConfirmProjectClosed:true`; every write auto-backs-up and read-back
   verifies. Resolve caches open projects in memory: after patching, fully QUIT
   and relaunch Resolve or the patch will not be visible.
+- **Subtitle DB edits**: `project_db` `list_captions` / `write_captions` /
+  `check_captions` cover text, bounds, explicit per-word timing, add and delete.
+  `list_subtitle_presets` / `copy_subtitle_preset` / `set_subtitle_preset` handle
+  animated Fusion holders separately from basic `list_subtitle_styles`.
+  New subtitle writes enforce full Resolve quit BEFORE patching, snapshot the
+  SQLite DB and verify transactionally. See
+  [subtitle-track editing](guides/subtitle-track-editing.md) for selectors,
+  Word Highlight controls, dry-run examples and live-validation limits.
 - **Guards are load-bearing.** Advanced tools refuse rather than fabricate
   (silent-lie guards): a thrown "refused" error usually means wrong input space,
   log-encoded frames, or missing media — read the message before retrying.
@@ -1787,6 +1795,10 @@ helpers:
 - `probe_audio_track(track_index?)`
 - `probe_audio_item(track_type?, track_index?, item_index?)`
 - `safe_set_audio_properties(properties, restore?, dry_run?, track_type?, track_index?, item_index?)`
+  — Volume / Pan / EQ writes are not honoured by Resolve's API; a request for
+  any of them returns a `known_limitation` block with the workaround (bake gain
+  into a rendered copy, or apply a Fairlight preset). `AudioSyncOffset` writes
+  do work.
 - `audio_mix_capability_report(...)`
 - `voice_isolation_capabilities(track_index?, track_type?, item_index?)`
 - `audio_mapping_report(clip_ids?)`
@@ -1860,11 +1872,20 @@ metadata. (For the raw camera file instead, use
   `frame` is the absolute timeline frame. Omit both to capture the playhead.
 
 The playhead, page, current timeline and Gallery are restored. The render route
-additionally touches project render settings: format and codec are restored and
-the render job is deleted, but `TargetDir`/`CustomName`/mark range cannot be read
-back on builds without `GetRenderSettings`, so they are reset to the full
-timeline rather than restored. Reach for `quality="thumbnail"` when zero side
-effects matter more than accuracy.
+additionally touches project render settings and puts them back: render mode,
+format, codec, mark range and output folder (`TargetDir`, read off a throwaway
+render job because there is no `GetRenderSettings`). The file name
+(`CustomName`) is never written, and the render job is deleted. One gap: a
+project that has never had an output folder has none to put back, and Resolve
+cannot clear one, so it is left on the capture's temporary folder
+(`capabilities` repeats this as `render_settings_caveat`). Reach for
+`quality="thumbnail"` when zero side effects matter more than accuracy.
+
+The render calls pull Resolve onto the Deliver page. The capture switches back
+and reads the page to confirm it. If a restore does not take (page, playhead,
+timeline, render mode, format, range or output folder), the image is followed by a
+`{"warnings": [...]}` block naming what was left changed and the call that puts
+it back. No warnings block means every restore was confirmed.
 
 ```
 timeline_frame(action="capture", params={"timecode": "01:00:15:12", "max_width": 1280})
@@ -1902,7 +1923,9 @@ Key actions:
 - `get_transform` / `set_transform(Pan?, Tilt?, ZoomX?, ZoomY?, RotationAngle?, ...)`
 - `get_crop` / `set_crop(CropLeft?, CropRight?, CropTop?, CropBottom?, ...)`
 - `get_composite` / `set_composite(Opacity?, CompositeMode?)`
-- `get_audio` / `set_audio(Volume?, Pan?, AudioSyncOffset?)`
+- `get_audio` / `set_audio(Volume?, Pan?, AudioSyncOffset?)` — Resolve ignores
+  Volume / Pan / EQ writes on audio (returns a `known_limitation` block); only
+  `AudioSyncOffset` / `AudioSyncOffsetIsManual` take effect
 - `get_voice_isolation_state` / `set_voice_isolation_state(state)` — Resolve
   20.1+; audio timeline items only
 - `get_keyframes(property)`, `add_keyframe(property, frame, value)`,
@@ -2185,6 +2208,19 @@ media_pool(action="safe_import_sequence", params={
   "end_index": 1048,
   "target_folder": "Master/Plates"
 })
+media_pool(action="import_bounded_media", params={
+  "source_path": "/absolute/path/source.mov",
+  "start_frame": 100,
+  "end_frame": 240,
+  "destination_folder": "Master/Selects",
+  "name": "Selected range"
+})
+# start_frame/end_frame are raw Resolve startFrame/endFrame values. The MCP does
+# not add or subtract a frame; inspect bounded_import_properties after creation.
+# Contributor-validated on DaVinci Resolve Studio 21.1.1 Build 10 (#275): this
+# itemInfo form created a native subclip, and endFrame was inclusive (0–300
+# reported 301 frames). Treat that as an observed configuration-specific result,
+# not a guarantee for every Resolve version or media type.
 media_pool(action="media_pool_boundary_report", params={"selected": True, "depth": 2})
 # Positioned append (MediaPool.AppendToTimeline([{clipInfo}, ...])) — e.g. rebuild a subtitle row after delete_clips
 media_pool(action="append_to_timeline", params={"clip_infos": [

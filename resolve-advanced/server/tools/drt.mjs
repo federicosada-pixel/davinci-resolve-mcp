@@ -316,7 +316,7 @@ export const drtTool = {
         if (!f || /[\/\\]/.test(f)) throw new Error(`assemble_project: folder must be a plain bin name (no path separators): ${JSON.stringify(t.folder)}`);
         return f;
       });
-      const { assembleTimeline } = drp();
+      const { assembleTimeline, escapeXml } = drp();
       const buffers = [];
       for (const [i, spec] of p.timelines.entries()) {
         const s = { ...spec, timelineName: names[i] };
@@ -459,7 +459,10 @@ export const drtTool = {
             bins.set(folder, bin);
           }
           const bin = bins.get(folder);
-          const tlRe = new RegExp(`<Element>\\s*<Sm2MpTimelineClip DbId="[^"]+">(?:(?!<\\/Element>\\s*<Element>)[\\s\\S])*?<Name>${names[i].replace(/[.*+?^$()|[\]{}]/g, '\\$&')}<\\/Name>[\\s\\S]*?<\\/Sm2MpTimelineClip>\\s*<\\/Element>`);
+          // The name reached the pool clip through escapeXml: `Reel 1 & 2` is stored
+          // `Reel 1 &amp; 2`, and the raw name matched nothing.
+          const nameXml = escapeXml(names[i]).replace(/[.*+?^$()|[\]{}]/g, '\\$&');
+          const tlRe = new RegExp(`<Element>\\s*<Sm2MpTimelineClip DbId="[^"]+">(?:(?!<\\/Element>\\s*<Element>)[\\s\\S])*?<Name>${nameXml}<\\/Name>[\\s\\S]*?<\\/Sm2MpTimelineClip>\\s*<\\/Element>`);
           const hit = mpXml.match(tlRe);
           if (!hit) throw new Error(`assemble_project: could not locate pool clip for timeline ${names[i]} to move into folder ${folder}`);
           mpXml = mpXml.replace(hit[0], '');
@@ -472,11 +475,17 @@ export const drtTool = {
         // scan, subfolders are not). Inner format byte-verified against the
         // template harvest: protobuf{field2: keyedDict{"0": binId, ...},
         // field4: time-varint} in the [u32 2][u32 len][0x81][zstd] wrapper.
-        const { zstdRawFrame } = requireCjs('../../vendor/drp-format/timeline-markers-blob.js');
+        const { zstdRawFrame, lenDelim } = requireCjs('../../vendor/drp-format/timeline-markers-blob.js');
         const binIds = [...bins.values()].map((b) => b.id);
         const childDict = encodeKeyedDict({ hdr: 1, entries: binIds.map((id, i) => ({ key: String(i), type: 0x0a, subType: 0, value: id })) });
+        // field 2's length is a protobuf VARINT, not one raw byte: one bin's
+        // dict is 95 bytes and fits, two bins' is 182 and does not, so
+        // `[0x12, 182]` emitted a 0xb6 continuation byte that swallowed the
+        // dict's first byte and read as length 54 — the registry parsed back
+        // empty with neither bin in it. lenDelim() writes the same single byte
+        // for the one-bin case, so that blob is unchanged.
         const inner = Buffer.concat([
-          Buffer.from([0x12, childDict.length]), childDict,
+          lenDelim(2, childDict),
           Buffer.from([0x20]), Buffer.from('b6cba6a90d', 'hex'),
         ]);
         const frame = zstdRawFrame(inner);
@@ -489,7 +498,7 @@ export const drtTool = {
         for (const [folder, bin] of bins) {
           base.file(bin.entry,
             `<?xml version="1.0" encoding="UTF-8"?>\n` +
-            `<Sm2MpFolder DbId="${bin.id}">\n <FieldsBlob/>\n <Name>${folder}</Name>\n` +
+            `<Sm2MpFolder DbId="${bin.id}">\n <FieldsBlob/>\n <Name>${escapeXml(folder)}</Name>\n` +
             ` <MpFolder>${masterFolderId}</MpFolder>\n <UniqueMediaPoolItemId>${randomUUID()}</UniqueMediaPoolItemId>\n` +
             ` <MediaVec>\n${bin.clips.join('\n')}\n </MediaVec>\n` +
             ` <MediaPool>${poolId}</MediaPool>\n <Folded>false</Folded>\n <ColorTag>FOLDER_COLOR_NONE</ColorTag>\n` +

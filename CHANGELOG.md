@@ -2,6 +2,788 @@
 
 Release history for the DaVinci Resolve MCP Server. The latest release is summarized in the root README; older entries live here to keep the README focused.
 
+## What's New in v4.10.6 — names that need xml escaping reach their bin and their color group
+
+### Fixes
+
+- **`drt(action="assemble_project")` failed outright when a timeline placed
+  in a bin had `&`, `"` or `'` in its name.** The pool clip stores the name
+  escaped (`Reel 1 &amp; 2`), but the step that moves it into its bin searched
+  for the raw `Reel 1 & 2`, found nothing, and threw
+  `could not locate pool clip for timeline Reel 1 & 2 to move into folder Reels`.
+  No archive was written. The lookup now matches the escaped name.
+  - **The bin's own name was written unescaped**, so `folder: "R&D"` produced
+    a `MpFolder.xml` that does not parse. It is escaped now.
+  - A name without those characters escapes to itself, so existing archives
+    come out byte-for-byte unchanged.
+  - Lands #283 from @Dev-next-gen, as submitted, with two tests that fail on
+    the old code.
+- **The same mistake in reverse affected color-group grade reads.** The
+  helpers behind `drp(action="extract_group_grades")` and
+  `drx(action="grade_transfer")` found a group by searching `project.xml` for
+  `<Name>` plus the raw name:
+  - asking for a group called `Night & Day` returned `group not found`, because
+    the file stores `Night &amp; Day`;
+  - the unfiltered listing reported the stored form, `Night &amp; Day`, as the
+    group's name;
+  - a clip or other element with the same name as a group, placed before it in
+    the file, made the lookup return a segment that spanned two groups and
+    both of their grades.
+
+  Group names are now decoded when read and compared as plain text. An
+  apostrophe resolves whether the file spells it `'` or `&apos;`. The lookup
+  only looks inside `<Sm2Group>` elements, and the label passed to the
+  decoder is escaped. A caller that passed the escaped form back
+  (`Night &amp; Day`) must now pass the plain name.
+
+### Validation
+
+- Offline file handling only; nothing calls Resolve. Advanced suite green,
+  with two new group-name tests that fail on the old code; Python suite green.
+- `assemble_project` changes the offline `.drp` authoring tier. The
+  round-trip harness was not run: it needs a Resolve 21.x Studio host, and
+  this machine runs 19.1.3.7. For a name without `&`, `"` or `'`, the archive
+  is byte-identical to before.
+
+## What's New in v4.10.5 — `rename_plan` sees a name the plan keeps
+
+### Fixes
+
+- **`media(action="rename_plan")` missed a rename onto a name that stays in
+  place.** It counted collisions only among the names it renames *to*, so a
+  name it leaves alone was invisible to the check. With
+  `names: ["A001_C001.mov", "dailies_A001_C001.mov"]`, `find: "dailies_"`,
+  `replace: ""`, the camera original was correctly refused, and the plan then
+  proposed renaming `dailies_A001_C001.mov` onto it with `collisions: 0`.
+  Applying that plan overwrites the file the refusal was protecting.
+  - A name the plan keeps now occupies its target: a refused camera original,
+    and a name `find` leaves unchanged. The same call returns
+    `action: "collision"`, `collisions: 1`, `renameCount: 0`.
+  - **`reel_normalize` had the same gap**: a reel already at its normalized
+    name was not counted, so `["card1", "CARD001"]` both landed on `CARD001`
+    with no collision. It is counted now.
+  - A swap (`b → x` while `x → y`) is still not a collision, since `x` is
+    leaving. Noops stay noops and refusals stay refusals.
+- Lands #284 from @Dev-next-gen, as submitted, with two tests that fail on
+  the old code.
+
+### Validation
+
+- Planning code only; nothing touches Resolve or media. Advanced suite
+  green; Python suite green.
+
+## What's New in v4.10.4 — enrolled in Anthropic's OSS Scanner
+
+### Security
+
+- **The repository now carries an OSS Scanner build and threat model**
+  under `.oss-scanner/`. [OSS Scanner](https://github.com/anthropics/oss-scanner)
+  builds a project in an isolated VM, scans it offline, and emails findings
+  to the maintainer. Keeping both files here means they can change without a
+  pull request to the scanner's repository.
+  - `.oss-scanner/Dockerfile` mirrors CI: Python 3.11, Node 22, ffmpeg, both
+    lockfiles via `npm ci`, then the offline suites. Built with the
+    scanner's `tools/check`: Python 4027 passed (26 skipped), advanced
+    server 1113 passed (60 skipped), 0 failed. Resolve is not in the image;
+    the suite stubs it as in CI.
+  - `.oss-scanner/threat_model.md` treats every MCP tool argument as
+    untrusted (LLM context can carry attacker text), and names the
+    properties a finding would break: no caller-supplied code execution,
+    the destructive-op gate, immutable source media, and the token- and
+    Host/Origin-gated local listeners. It points at the subprocess call
+    sites and the archive/XML/SQLite parsers, cites the four published
+    advisories as examples of each class, and sets severity tiers.
+- No server code changed.
+
+## What's New in v4.10.3 — the conform-qc tests run, and run in `npm test`
+
+### Tests
+
+- **The vendored conform-qc suite was never part of `npm test`, and 20 of its
+  118 tests failed** (reported from a macOS validation run in the #273
+  thread). Three causes, all fixed:
+  - **The synthetic fixture was never committed.** `synthetic/generate.js`
+    builds a small, anonymised turnover XML, test-pattern frames and their
+    answer keys, and its own docs say the output is committed under
+    `__fixtures__/synthetic/`. It now is: 9 files, about 224 KB, every name
+    and path a `SYNTH_` placeholder, and byte-for-byte reproducible (generated
+    twice and compared). The npm packages exclude it.
+  - **Tests that need the client answer key crashed instead of skipping.**
+    `__fixtures__/sample-reel-01` is derived from client material and stays
+    out of the repository; `reelFixtureDir()` documents that its tests skip
+    when it is absent. A shared `test/_client-fixture.js` now does that.
+    Seven files whose setup is built on the key skip as a whole, with a
+    reason. In `compare`, `geometry`, `verify` and `workflow-driver` only the
+    tests that read the key skip, so their client-free tests keep running.
+  - **The runbook check had gone stale.** It expected "two surfaces" and a
+    "Cloud" surface. The runbook now says it "covers both surfaces" and that
+    the engine "ships only the local path" with other hosts composing their
+    own, and its bold markup and line wrapping broke one more pattern. The
+    patterns follow the runbook; the runbook is unchanged.
+- `resolve-advanced`'s `npm test` and `test:libs` now include
+  `vendor/conform-qc/test/*.test.js`: the advanced suite runs 1,173 tests
+  (from 1,036), 0 failed, with every skip carrying its reason.
+
+### Validation
+
+- Test and packaging changes only; no server or engine code changed. Python
+  suite green; advanced suite 1,173 / 0 failed in a clean worktree.
+
+## What's New in v4.10.2 — place_fusion_title measured on another build; the .drp harness says when it can't run
+
+### Documentation
+
+- **`place_fusion_title` is inert on the free edition 21.1.0 too.** The
+  harness's `RT_TITLE` project was built offline and imported into free
+  Resolve 21.1.0 through the Project Manager. A second into the title the
+  viewer was black, while a `place_generator` SMPTE Color Bar project built and
+  imported the same way rendered. `vendor/drp-format/README.md` now lists the
+  builds measured: inert on Studio 21.0.4.5 and free 21.1.0, with one
+  contributor-reported visible render on Studio 21.0.3.7 (#273 thread) that has
+  not been reproduced here. The harness keeps `place_fusion_title` as
+  known-broken.
+- `docs/process/release-process.md`: the round-trip harness needs a Resolve
+  21.x host, and external scripting cannot drive the free edition. When no
+  21.x Studio is available, the release notes say the harness was not run.
+
+### Changed
+
+- `tests/live_drp_roundtrip_verification.py` stops with `CANNOT RUN` (exit 2)
+  on a Resolve older than 21, instead of reporting every case as a failure.
+  It authors the Resolve 21 project format, which 19.1.3.7 refuses at
+  `ImportProject` (all six cases failed there before any frame was checked).
+
+### Validation
+
+- No server code changed; offline suite green. The free 21.1.0 result is a
+  manual import and viewer check, not a harness run.
+
+## What's New in v4.10.1 — the server's own tools stay first on PATH; portable runtime tests
+
+### Fixed
+
+- **A tool installed alongside the server could be shadowed by an older
+  system copy.** At import, `media_analysis` adds the interpreter's script
+  directory and the standard tool directories (`/opt/homebrew/bin`,
+  `/usr/local/bin`, …) to `PATH`, meaning to put the server's own venv first.
+  When the venv was already on `PATH` (an activated environment) but the
+  Homebrew directories were not, the missing directories were prepended in
+  front of it, so a `whisper` or `ffmpeg` in `/opt/homebrew/bin` won over the
+  one installed with the server. The venv's script directory now always comes
+  first; every other entry is kept, and the call stays idempotent. Reported
+  by @sidevconcept from a macOS validation run (#273); the existing test only
+  caught it on a host whose `PATH` lacked Homebrew.
+
+### Tests
+
+- `tests/test_child_process_text_encoding.py`: with `PATH` pinned to the venv
+  plus system directories, the venv stays first, whether it was listed first
+  or in the middle. Fails on v4.10.0.
+- `tests/test_headless_runtime.py` and `tests/test_dashboard_source_review.py`
+  (@sidevconcept, #282, related to #278): the macOS process-table fixtures pin
+  their platform instead of following the test host, a launch-path assertion
+  normalizes separators, and the source-review test closes its cached SQLite
+  connection before its temporary directory is removed, which Windows
+  requires. Test-only.
+
+### Validation
+
+- Offline suite green. No Resolve scripting call changed.
+
+## What's New in v4.10.0 — subtitle caption and preset editing in saved projects
+
+### Added
+
+- **Subtitle editing through `project_db`.** Resolve's scripting API can
+  generate and list subtitles but cannot change caption text, word timing or
+  a track's animation controls (`TimelineItem.SetProperty` does not reach
+  them). Six new actions edit them in a saved local project's `Project.db`:
+  - `list_captions`, `check_captions` and `write_captions`: caption text,
+    frame bounds and explicit per-word timing; add, replace and delete in one
+    transaction, preserving unknown fields and the original AI words.
+  - `list_subtitle_presets`, `copy_subtitle_preset` and
+    `set_subtitle_preset`: clone a compatible saved animation preset, and edit
+    Word Highlight's font, position, text / highlight / outline colours and
+    outline thickness.
+- Writes require Resolve **fully quit** (checked through the process list,
+  plus `iConfirmProjectClosed:true`), take a unique SQLite snapshot backup
+  including committed WAL pages, refuse unsupported schemas, and run the edit
+  and its readback in one transaction. `verified:true` means database
+  readback, not a render. SQLite uses `better-sqlite3`, or `node:sqlite` on
+  Node 22.16+ / 23.8+. See `docs/guides/subtitle-track-editing.md`.
+- A live `TimelineItem.SetProperty` on a subtitle item is refused before the
+  automatic timeline archive, with a pointer to these actions.
+
+Contributed by @sidevconcept (#273).
+
+### Changed during review
+
+- **No writes while Resolve runs.** An opt-in to write a project that is not
+  currently loaded was removed. Measured on Studio 19.1.3.7: a project loaded
+  earlier in the session is served from memory when loaded again, so a disk
+  write to it is not shown, and saving after editing the same rows
+  overwrites it. A fresh launch does read it.
+- **Text colour.** The writer set the Word Highlight macro's `Clone` colour
+  controls, which do not render, leaving the template's default pale yellow;
+  it now writes the Text+ shading inputs (`Red1`/`Green1`/`Blue1`/`Alpha1`).
+- **Handle release.** A guarded database is closed when a schema query throws,
+  a likely cause of the slow tests reported on Windows.
+
+### Validation
+
+- Contributor-validated on Studio 21.1.0.17 / Windows: a synthetic caption
+  edit, full quit, database write, relaunch and burn-in render passed on all
+  630 decoded frames, with white base text, yellow highlighting and exact
+  word transitions, checked against a natively configured control. Not
+  rendered on this project's 19.1.3.7 host.
+- Offline: Node advanced suite 1,036 tests / 0 failed in a clean worktree;
+  Python suite green.
+
+## What's New in v4.9.3 — .drp bin registry for two or more bins; broader temp-root guard tests
+
+### Fixed
+
+- **`drt(action="assemble_project")` registered no bins when timelines went
+  into two or more of them.** The Master folder's `FieldsBlob` is the
+  subfolder registry, `protobuf{field2: keyedDict{"<i>": binId}, field4:
+  time}`, and field 2's length was written as one raw byte. One bin's dict is
+  95 bytes and fits; two bins' is 182, emitted as `0xb6`, whose continuation
+  bit swallowed the dict's first byte and read back as length 54; three bins'
+  269 was truncated to 13. The archive carried every bin directory while its
+  registry decoded to zero entries. The length is now written with the
+  module's existing length-delimited field writer, which emits the same
+  single byte for one bin, so single-bin output is byte-for-byte unchanged.
+  Found and fixed by @Dev-next-gen (#280).
+
+### Tests
+
+- `resolve-advanced/test/drt-assemble-extract.test.mjs`: two timelines in two
+  bins; the registry's declared length covers exactly the keyed dict, both
+  bin ids are present, and field 4 follows. Fails on v4.9.2.
+- `tests/test_source_media_guard.py` (@AllastorV, #277): broad temp roots
+  (the profile, every ancestor of it, `..` and case variants, the working
+  directory), chosen through `TEMP` / `TMPDIR` / `TMP` and through the real
+  environment, never license a media write or delete; a narrow Windows temp
+  dir is scratch while a `Temp-media` sibling is not; and an explicit
+  `RESOLVE_MCP_SCRATCH` opt-in still applies to a rejected temp root.
+
+### Known gap
+
+- On the 19.x template path (`targetAppVersion: "19.1.3"`) the registry is
+  not written at all: the template's Master `FieldsBlob` already registers its
+  own `000_Archive` bin, so the replacement that targets an empty blob finds
+  nothing. Bins assembled for 19.x stay unregistered whatever their count.
+  Reported in #280; not changed here.
+
+### Validation
+
+- Offline suites green. No live Resolve run: the changed bytes are written
+  only for 21.1-target archives, which this project's 19.1.3.7 host cannot
+  import, and the one-bin blob is unchanged. The guard change is tests only.
+
+## What's New in v4.9.2 — the source-media guard recognises Windows temp space
+
+### Fixed
+
+- **On Windows the source-media guard denied every write into temp space.**
+  `is_scratch()` compared the normalized path against `SCRATCH_ROOTS`
+  (`/tmp`, `/private/tmp`, `/var/folders`) without normalizing the roots, so
+  on Windows `/tmp/out.mp4` normalized to `c:\tmp\out.mp4` and never matched
+  `/tmp`; and Windows' real temp directory (`%TEMP%`) was not a root at all.
+  `ffmpeg … /tmp/out.mp4`, `rm /tmp/work/proxy.mp4` and writes under
+  `%TEMP%` were all refused. The roots are now normalized the same way as the
+  path, and on Windows `%TEMP%` is a scratch root. Found and fixed by
+  @AllastorV (#277).
+
+### Changed on landing
+
+- **The temp directory is trusted only on Windows, and only when narrow.**
+  `tempfile.gettempdir()` follows `TMPDIR` / `TEMP` / `TMP`, which are set
+  for reasons unrelated to this guard; in post they often point at the media
+  drive. Measured on macOS with the change as submitted: with `TMPDIR` set to
+  the home directory, `ffmpeg -y` overwrites and `rm` under `~/Movies` were
+  allowed, where v4.9.1 denied them. So the temp directory is added only on
+  Windows (on Linux and macOS the default temp dir is already under
+  `SCRATCH_ROOTS`), and it is refused when it is a drive or filesystem root,
+  the user profile or an ancestor of it, or the working directory, which
+  `gettempdir()` falls back to when nothing else is writable.
+
+### Tests
+
+- `tests/test_source_media_guard.py`: a write into the platform temp dir is
+  allowed; with `TMPDIR`/`TEMP`/`TMP` set to the home directory, an overwrite
+  and a delete there are still denied (both fail on the change as
+  submitted); and `platform_temp_root` refuses a filesystem root, the profile
+  and its ancestors, and the working directory, accepts a narrow temp folder
+  even on a media drive, and never trusts the variable off Windows.
+
+### Validation
+
+- Guard-only change; no Resolve scripting call changed. The Windows path
+  normalization was verified by the contributor on Windows 11; the
+  Windows-only branch is unit-tested here with injected values, since this
+  project has no Windows host.
+
+## What's New in v4.9.1 — a rejected audio level write now says why, and what to do instead
+
+### Changed
+
+- **`safe_set_audio_properties` and `timeline_item set_audio` explain a
+  refused Volume / Pan / EQ write.** Resolve's scripting API has no write path
+  for audio clip or track level — `SetProperty('Volume'/'Level'/'Gain')`
+  returned `False` when measured live on 21.0.0, and `'Pan'` is the *video* transform
+  key, so it returns `True` while the audio pan does not move. A caller who saw
+  `{"write": false}` (or a `Pan` that "succeeded" and changed nothing) had no
+  way to tell "bad value" from "this cannot be written from the API at all" —
+  and the second is a different task. Both actions now attach a
+  `known_limitation` block when a level or EQ write fails, and on every `Pan`
+  write (its success is the misleading case): the
+  `api_truth` ledger entry plus the concrete ways around it (bake the gain into
+  a rendered copy of the source with ffmpeg; or save the mix once as a
+  Fairlight preset and apply it per-timeline with
+  `project_settings apply_fairlight_preset`, on Resolve 20.2.2+ only; the
+  preset methods are absent on 19.x). `AudioSyncOffset` writes are
+  unaffected — they work, and are not flagged. The legacy granular
+  `set_timeline_item_audio` returns the same guidance as its failure string.
+  Contributed by @youssefm3208-jpg (#279).
+
+### Changed on landing
+
+- A `Volume` / `Level` / `Gain` / EQ write is flagged only when Resolve
+  refused it, so a build that honours the write is not told it is impossible.
+- The Fairlight-preset workaround names its Resolve 20.2.2 floor.
+
+### Tests
+
+- `tests/test_audio_fairlight_probe.py`: a refused Volume write carries the
+  ledger entry and workarounds; a Pan write is flagged even when it returns
+  True; `AudioSyncOffset` is not flagged; an honoured Volume write is not
+  flagged; the preset workaround states its version floor.
+
+### Validation
+
+- Response-shape change only; no Resolve scripting call changed, so no live
+  run was required. The Volume/Pan behaviour is the `api_truth` ledger's live
+  measurement on 21.0.0.
+
+## What's New in v4.9.0 — bounded Media Pool import
+
+### Added
+
+- **`media_pool(action="import_bounded_media")`** creates one bounded Media
+  Pool item from a source file through
+  `MediaStorage.AddItemListToMediaPool([{media, startFrame, endFrame}])`.
+  Params: `source_path` (absolute, must exist), `start_frame`, `end_frame`,
+  `destination_folder` (must already exist) and `name`. The import lands in
+  the destination folder, which is made current only for the one call; the
+  previous current folder is restored afterwards, including when the import
+  fails. The result carries the item summary and the range properties
+  Resolve reports for it (`bounded_import_properties`). `start_frame` and
+  `end_frame` are passed through unchanged; the wrapper does not adjust for
+  end-frame inclusivity. If the rename fails after Resolve has created the
+  item, the error says the item exists under Resolve's default name and
+  returns its id in `state`, so it can be renamed or deleted rather than
+  imported twice. `media_storage.import_to_pool(item_infos)` remains the
+  raw passthrough. Contributed by @dmourati (#275).
+- Contributor-validated on Studio 21.1.1 Build 10: this itemInfo form created
+  a native subclip, and `endFrame` was inclusive (0–300 gave 301 frames).
+  That is one tested configuration, not a guarantee for other builds or
+  media types; not measured on this project's 19.1.3.7 machine.
+
+### Safety
+
+- The action is registered as a write (`destructive_hook`) and rated LOW
+  (`execution_lifecycle`): it only adds an item, and neither the source nor
+  existing pool contents change. Safe mode, the dry-run refusal and the
+  operation log now see it. `docs/reference/readwrite-symmetry.md`
+  regenerated.
+
+### Tests
+
+- `tests/test_media_pool_ingest_probe.py`: input validation never reaches
+  Resolve, the folder is restored on success and failure, `MediaStorage`
+  comes from the Resolve object rather than the project manager, and a
+  failed rename reports the created item.
+- `tests/test_execution_lifecycle.py`: the action classifies as a
+  recognised, destructive, LOW-risk write.
+
+### Validation
+
+- Offline suite green. The live result above is the contributor's, on
+  Studio 21.1.1 Build 10.
+
+## What's New in v4.8.30 — conform_lint reports every reuse of one source
+
+### Fixed
+
+- **`editorial(action="conform_lint")` reported only the first reuse when
+  several pulls came from inside one long pull.** `check_duplicate_usage`
+  sorted each source's pulls by in-point and compared each one only with the
+  pull just before it. A long take followed by short callbacks lifted from
+  inside it therefore compared the second callback against the first, which
+  it does not overlap, and the reuse of the long take went unreported from
+  then on. An interview used at 0–5000 with callbacks at 100–200 and 300–400
+  reported one reuse instead of two. Each pull is now compared with the
+  earlier pull that reaches furthest, so every pull that overlaps any earlier
+  pull is flagged. Where out-points already increase that is the previous
+  pull, so ordinary material is reported exactly as before; adjacent pulls
+  are still two shots, not a duplicate. Contributed by @Dev-next-gen (#276).
+
+### Tests
+
+- `tests/test_conform_lint.py` gains `DuplicateUsageTests`, the check's first
+  tests: adjacent pulls stay unreported, and every callback inside one long
+  pull is reported. The second fails on v4.8.29 with the
+  `INTERVIEW`/`CALLBACK 2` pair missing.
+
+### Validation
+
+- `lint_timeline` is a pure function over a timeline snapshot; no Resolve
+  scripting call changed, so no live run was required.
+
+## What's New in v4.8.29 — optional granular arguments accept an explicit null
+
+### Fixed
+
+- **Sixteen optional arguments on nine granular tools rejected `null`.**
+  They were annotated `str` / `float` / `bool` / `int` with a `None`
+  default, so the generated schema advertised `"default": null` on a field
+  whose type excluded null. Clients that fill every optional argument with
+  its advertised default sent `null`, and the call failed argument
+  validation before the tool ran. Affected: `create_project`
+  (`media_location_path`), `set_color_space_tool` (`gamma`),
+  `import_layout_preset_tool` and `import_user_preferences_preset`
+  (`preset_name`), `set_timeline_item_composite` (`composite_mode`,
+  `opacity`), `set_timeline_item_retime` (`speed`, `process`),
+  `set_timeline_item_stabilization` (`enabled`, `method`, `strength`),
+  `set_timeline_item_audio` (`volume`, `pan`, `eq_enabled`) and
+  `modify_keyframe` (`new_value`, `new_frame`). They are now `Optional[T]`;
+  callers that omit them see no change. Only the granular server (`--full`)
+  was affected. Contributed by @vishalhabib99 (#274).
+
+### Tests
+
+- `tests/test_tool_schema_null_defaults.py` (new) lists every tool on the
+  compound and granular servers offline and fails on any argument whose
+  default is null but whose schema rejects null. On v4.8.28 it names all
+  sixteen.
+
+### Validation
+
+- Schema-only change; no Resolve scripting call changed, so no live run was
+  required.
+
+## What's New in v4.8.28 — ffmpeg can no longer hang on the protocol stream; a cancelled call no longer kills the server
+
+### Fixed
+
+- **ffmpeg could hang indefinitely while reading the server's stdin.** Every
+  ffmpeg/ffprobe analysis pass (`edit_engine plan_silence_ripple`, media
+  analysis, sync detection, sound density and the rest) ran through a
+  runner that let the child inherit the server's stdin. Over stdio that is
+  the JSON-RPC stream. ffmpeg polls stdin for keyboard commands; the `c` in
+  `"jsonrpc"` opens its interactive command prompt, which then waits for a
+  newline while consuming the protocol bytes it reads. Measured with ffmpeg
+  9.0.2: a partial frame arriving mid-pass hung a silencedetect run until it
+  was killed, and the same run with `stdin=subprocess.DEVNULL` finished
+  normally. The runner, and all 29 other call sites under `src/` that spawned
+  a child without `stdin=`, now pass `stdin=subprocess.DEVNULL`. Reported on
+  Windows with the free 21.0.2 bridge (#272); the mechanism was reproduced on
+  macOS, and the Windows build was not available to test.
+- **A tool call cancelled by the client could take the whole session down.**
+  Tool bodies run in a worker thread, and the wait for that thread is
+  shielded from cancellation. When the client cancelled (for example after
+  its own timeout) and the body finished later, its result came back as if
+  nothing had happened. The SDK then tried to answer a request it had already
+  answered "cancelled", and its `Request already responded to` assertion
+  closed the connection. The pending cancellation is now raised once the
+  body returns, which the SDK treats as the cancellation it already
+  acknowledged. The body still runs to completion, so Resolve is never left
+  half-mutated; only its result is discarded.
+
+### Tests
+
+- `tests/test_subprocess_stdin_discipline.py` (new) fails the suite on any
+  `subprocess.run/Popen/call/check_call/check_output` under `src/` that does
+  not pass `stdin=` or `input=`, in any import spelling. With the fix
+  reverted it names all 30 sites (the runner plus the 29 others).
+- `tests/test_threaded_tool_dispatch.py` gains an end-to-end case over the
+  real SDK's in-memory transport: it cancels a call mid-body, lets the body
+  finish, and requires the next call to succeed. With the fix reverted, it
+  fails with the reported `AssertionError`.
+
+### Validation
+
+- No Resolve scripting call changed. Both mechanisms were reproduced before
+  the fix and confirmed fixed after it, on macOS with ffmpeg 9.0.2 and
+  mcp 1.30.0. Not tested on Windows.
+
+## What's New in v4.8.27 — Linux exports no longer redirected away from /tmp-named folders
+
+### Fixed
+
+- **On Linux, an output folder whose name merely began with `/tmp` or
+  `/var/tmp` was silently replaced.** `_resolve_safe_dir` tested
+  `path.startswith("/tmp")`, which is also true of `/tmpdata`, `/tmpfiles`,
+  `/tmp-scratch` and `/var/tmpdata`. Each was treated as a temp directory and
+  swapped for `~/Documents/resolve-stills`, and
+  `gallery_stills(grab_and_export)` then reported that folder as if it were the
+  one asked for. The same helper picks the output folder for `encrypt_dctl` and
+  the granular `save_project` export fallback. The Linux branch now compares by
+  path segment, as the macOS branch already did; `/tmp`, `/tmp/…`, `/var/tmp`
+  and `/var/tmp/…` still redirect. Both copies of the helper (`src/server.py`
+  and `src/granular/common.py`) are fixed. Thanks to @Dev-next-gen (#271).
+
+### Tests
+
+- `tests/test_granular_safe_dir.py` gains a Linux class covering both copies:
+  real temp paths still redirect, sibling names are left alone.
+
+### Validation
+
+- Path classification only, decided before any Resolve call; no Resolve
+  behavior changed. Live test not required.
+
+## What's New in v4.8.26 — two dead layout-preset helpers removed
+
+### Removed
+
+- `src/utils/layout_presets.py` no longer carries `save_layout_preset` and
+  `load_layout_preset`. Both went through `Resolve.GetUIManager()` and then
+  `SaveUILayout` / `LoadUILayout`, none of which exist on any build measured
+  (Studio 19.1.3.7; see the `api_truth` entry added in v4.8.25). Nothing called
+  them: the granular `save_layout_preset_tool` and `load_layout_preset_tool`
+  use `Resolve.SaveLayoutPreset` / `LoadLayoutPreset` directly, and still do.
+  No tool, action or count changes. The module docstring now says what the
+  file actually does (preset files on disk) and where live save/load happens.
+- `scripts/audit_api_parity.py` drops `LoadUILayout` and `SaveUILayout` from
+  its allowlist, since no source calls them any more.
+
+### Validation
+
+- No Resolve behavior changed; the removed functions had no callers. Live test
+  not required.
+
+## What's New in v4.8.25 — open_settings and open_app_preferences say what Resolve cannot do
+
+### Fixed
+
+- **The granular `open_settings` and `open_app_preferences` tools could never
+  work, and reported that as an ordinary failure.** Both went through
+  `Resolve.GetUIManager()`, which does not exist. Measured on Studio 19.1.3.7:
+  `dir(resolve)` lists 23 methods and `GetUIManager` is not one of them;
+  `Fusion().UIManager` is real but has neither `OpenProjectSettings` nor
+  `OpenPreferences`; and none of the three names appears in the 21.1 typed API.
+  The call raised `'NoneType' object is not callable`, a broad `except`
+  swallowed it, an ERROR was logged, and the tool answered
+  `Failed to open Project Settings dialog` with no reason.
+  Both tools now answer `Not supported:` and name the call that is missing;
+  `open_settings` also names the tools that read and write project settings.
+  Nothing is logged as an error, because nothing went wrong.
+- The route is now probed with `has_method` rather than `hasattr`, which is
+  true for every name on a Resolve object. If a future build does provide these
+  calls they are used, and their result is reported: the old code discarded the
+  return and answered success regardless, so a refusal would have read as a
+  dialog that opened.
+
+### Documentation
+
+- `api_truth` records the absence, with what `Fusion().UIManager` does expose.
+  Whether `UIManager.DoAction` or `QueueAction` can open these dialogs was not
+  tried: both dialogs are modal, and a modal dialog blocks the scripting API
+  until a person closes it.
+- `scripts/audit_api_parity.py` no longer describes `GetUIManager` as a
+  documented API.
+
+### Tests
+
+- `tests/test_app_control_dialogs.py`: a fake that fabricates attributes the way
+  a Resolve object does (every `hasattr` true, a missing `getattr` is `None`).
+  Covers the measured build, a manager without the method, a build that has
+  the call, a refusal, an exception, and both granular tools. Eight of its
+  twelve tests fail against v4.8.24.
+- `tests/test_discarded_resolve_returns.py` now covers every `Open*` call, not
+  only `OpenPage`.
+
+## What's New in v4.8.24 — a frame capture leaves the render output folder and file name alone
+
+### Fixed
+
+- **`timeline_frame` capture left the project's render output folder and file
+  name on its own temporary values.** The render route (`quality="frame"`,
+  `"preview"`, `"full"`) wrote `TargetDir` and `CustomName` and put neither
+  back, because there is no `GetRenderSettings` to read them from. The user's
+  next render job inherited a temporary folder the capture had already deleted
+  and a name like `capture-<timestamp>`. v4.8.23 documented this; this release
+  fixes it.
+  - **Output folder (`TargetDir`).** A queued render job carries the settings it
+    inherited, so the capture queues a throwaway job, reads `TargetDir` off its
+    `GetRenderJobList` entry, deletes the job, and writes the folder back
+    afterwards. A folder that is not put back, or a throwaway job that cannot
+    be removed, is reported in the capture's `warnings` block.
+  - **File name (`CustomName`).** It is no longer written at all. It can be
+    neither read back nor cleared (an empty one is refused), so the capture
+    renders under whatever name the project already produces, into a private
+    folder of its own, and takes the one file that appears there.
+  - Live on Studio 19.1.3.7, with a `.mov` format, an output folder and a custom
+    name set: a job queued after each of 15 captures inherited the same folder,
+    file name, range and format as one queued before, and the render queue was
+    left empty.
+- **One gap remains, and it is stated rather than hidden.** A project that has
+  never had an output folder has none to read (`AddRenderJob` returns `''`),
+  and Resolve cannot clear one once set, so such a project is left with the
+  capture's temporary folder as its `TargetDir`. `timeline_frame capabilities`
+  reports this as `render_settings_caveat`.
+- The captured frame can no longer be confused with, or delete, another file in
+  the shared capture folder. Each capture renders into its own subfolder; the
+  shared one (`~/Documents/resolve-stills` on macOS) is only removed when empty.
+
+### Changed
+
+- `timeline_frame capabilities`: `render_settings_restorable.TargetDir` and
+  `.CustomName` are now `true`, and `render_settings_caveat` is new.
+- A render capture takes about 0.2 s longer (measured: roughly 1.3 s against
+  1.1 s), which is the throwaway job used to read the output folder.
+
+### Documentation
+
+- `api_truth` gains `Project.AddRenderJob (the only readback for render
+  settings)`, measured on Studio 19.1.3.7: what a job entry exposes, that
+  `TargetDir` cannot be cleared, when `AddRenderJob` returns `''`, and that
+  duplicate jobs and existing output files raise no dialog.
+  `docs/reference/api-limitations.md` is regenerated.
+
+### Tests
+
+- `tests/test_playhead_frame_capture.py`: the render fake now models the job
+  queue as the readback it is. `CaptureOutputSettingsTest` covers the folder
+  coming back, the name never being written, a project with no output folder, a
+  same-named file already in the shared folder, the read happening in
+  single-clip mode before anything changes, and both failure reports. Six of
+  its ten tests fail against v4.8.23.
+- `tests/live_frame_capture_page_restore_validation.py` now gives the disposable
+  project a user's render settings and compares what a job inherits before and
+  after every capture, including one from Individual-clips mode.
+
+## What's New in v4.8.23 — a frame capture no longer leaves Resolve on the Deliver page
+
+### Fixed
+
+- **`timeline_frame` capture left Resolve on the Deliver page.** ([#270](https://github.com/samuelgursky/davinci-resolve-mcp/issues/270), reported by @Dragonfist76 on Studio 21.1.0.17)
+  The render route (`quality="frame"`, `"preview"`, `"full"`) recorded the page
+  to return to *after* calling `Project.GetCurrentRenderMode()`. That getter
+  switches Resolve to the Deliver page by itself (measured on Studio 19.1.3.7
+  from Edit, Color and Fairlight), so the page recorded was always `deliver` and
+  the restore was skipped as having nothing to do. The page is now read before
+  any render call. Live on 19.1.3.7: 14 captures from seven starting pages all
+  ended on the page they started on.
+- **A restore that does not take is no longer silent.** The switch back is read
+  back with `GetCurrentPage()`. If the page, playhead, current timeline, render
+  mode, render format or render range is not put back, the image is followed by
+  a `{"warnings": [...]}` block naming what was left changed and the call that
+  restores it; an error result carries the same `warnings` key. A clean capture
+  is unchanged: one image.
+- **The render range was never restored after a capture.** The restore shared a
+  `SetRenderSettings` payload with `CustomName: ""`, and Resolve refuses an empty
+  `CustomName` by rejecting the whole payload (measured on 19.1.3.7: `False`, and
+  a job queued afterwards still carried `MarkIn == MarkOut ==` the captured
+  frame). The range now goes in its own payload and its result is checked. Live
+  on 19.1.3.7: a job queued after each capture carried the whole timeline.
+- **`render get_mode`, `render probe_render_settings` and the granular
+  `get_current_render_mode` left Resolve on the Deliver page**, for the same
+  reason: they call the same getter. They now return to the page they were
+  called from.
+- **`resolve_control restore_state` reported the page as restored without
+  checking.** `OpenPage`'s return was discarded. `restored.page` is now written
+  only when the page reads back, and `page_error` says why otherwise.
+- The Color-page and Edit-page guards used by thumbnails and timeline edits
+  discarded `OpenPage` on their way back too. Both now read the page back and
+  log a failure.
+
+### Changed
+
+- `timeline_frame capabilities` returns `render_settings_restorable`, which its
+  docstring already listed. `TargetDir` and `CustomName` are `false`: there is no
+  `GetRenderSettings`, so after a render capture they stay on the capture's
+  temporary folder and name. The docs previously said they were reset.
+
+### Documentation
+
+- `api_truth` gains two measured entries, both on Studio 19.1.3.7:
+  `Project.GetCurrentRenderMode` switches to the Deliver page (with the list of
+  render calls that do and do not), and `Project.SetRenderSettings` rejects a
+  whole payload over an empty `CustomName`. `docs/reference/api-limitations.md`
+  is regenerated.
+
+### Tests
+
+- `tests/test_playhead_frame_capture.py`: the render fake now behaves as
+  measured (the mode getter switches page; an empty `CustomName` refuses the
+  payload). New tests cover the page coming back, a refused or lying `OpenPage`
+  being reported with the image, the warning reaching an MCP client as a text
+  block after the image, and the range Resolve holds after a capture. The two
+  regression tests fail against v4.8.22.
+- `tests/test_page_restore.py`: `restore_page`, `restoring_page`, both page
+  guards, the three render-mode readers and `restore_state`.
+- `tests/test_discarded_resolve_returns.py` now treats `OpenPage` and the
+  `open_page_serialized` wrapper as mutators whose return must be used.
+- `tests/live_frame_capture_page_restore_validation.py`: the live harness behind
+  the numbers above.
+
+## What's New in v4.8.22 — the control panel port check cannot hang on a wedged lsof
+
+### Fixed
+
+- **`open_control_panel` could block forever behind an unkillable `lsof`.** The
+  port-owner check ran `lsof -iTCP:<port> -sTCP:LISTEN -t` through
+  `subprocess.run(timeout=3)`. On macOS, lsof wedges in uninterruptible kernel wait
+  (state `U` in `ps`) when a network mount is stale, and a process in that state
+  ignores SIGKILL. `subprocess.run`'s timeout path kills the child and then waits
+  for it, so the 3-second timeout never returned: the caller hung with the child.
+  Measured on 2026-09-26 on the release machine, where 489 lsof processes had been
+  stuck for 12 hours and the offline suite sat in this function for 13 minutes.
+  `_port_owner_pid` now starts lsof in its own session, polls to the deadline, and
+  on expiry sends SIGKILL and abandons the child instead of joining it. stdout is
+  read only once `poll()` reports an exit, and the pipe is closed on every path.
+  A missing lsof is still `None`, not an exception.
+
+### Tests
+
+- `tests/test_port_owner_pid.py`: a fake child whose `poll()` never returns and
+  whose `kill()` is a no-op yields `None` within the deadline with `wait()` and
+  `communicate()` never called and the pipe closed; an exited child still yields
+  its PID; a missing binary yields `None`; and a real subprocess that ignores
+  SIGTERM, with `kill` patched out, is left running rather than joined.
+
+## What's New in v4.8.21 — timeline duration no longer overcounts by one frame
+
+### Fixed
+
+- **Two timeline-duration readers reported one frame too many.** ([#269](https://github.com/samuelgursky/davinci-resolve-mcp/pull/269), @Dev-next-gen)
+  The granular `get_current_timeline` and `get_project_info`'s per-timeline
+  `duration` computed `GetEndFrame() - GetStartFrame() + 1`, while the compound
+  server, `brain_edits` and `render_stress` all use `GetEndFrame() - GetStartFrame()`
+  for the same timeline. `GetEndFrame()` is one past the last frame, so the `+ 1`
+  counted a frame that does not exist: a 600-frame timeline read back as 601. Both
+  readers now agree with the rest of the server.
+
+### Documentation
+
+- **`api_truth` records `Timeline.GetEndFrame` as an exclusive bound.** Measured
+  live on Studio 19.1.3.7 while reviewing #269: a timeline whose only full-length
+  item is a 32742-frame clip reads start 0 / end 32742, and the item's
+  `GetEnd()` is also 32742. The entry sits beside the existing
+  `AppendToTimeline clipInfo endFrame` entry, which documents the same half-open
+  convention on the write side, so the frame-count rule is now findable from
+  either direction.
+
+### Tests
+
+- `tests/test_timeline_duration.py` (from the PR): both readers return
+  `end - start` for a stubbed 86400..87000 timeline; fails on v4.8.20 with 601.
+- `tests/test_api_truth.py`: the new ledger entry is findable by `GetEndFrame`,
+  carries the `off-by-one` tag, and states the `end - start` rule.
+
 ## What's New in v4.8.20 — every boolean param honours `"false"`
 
 ### Fixed

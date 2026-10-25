@@ -358,8 +358,8 @@ def set_timeline_item_crop(timeline_item_id: str,
 @mcp.tool()
 @granular_destructive_op()
 def set_timeline_item_composite(timeline_item_id: str, 
-                               composite_mode: str = None, 
-                               opacity: float = None) -> str:
+                               composite_mode: Optional[str] = None, 
+                               opacity: Optional[float] = None) -> str:
     """Set composite properties for a timeline item.
     
     Args:
@@ -446,8 +446,8 @@ def set_timeline_item_composite(timeline_item_id: str,
 @mcp.tool()
 @granular_destructive_op()
 def set_timeline_item_retime(timeline_item_id: str, 
-                            speed: float = None, 
-                            process: str = None) -> str:
+                            speed: Optional[float] = None, 
+                            process: Optional[str] = None) -> str:
     """Set retiming properties for a timeline item.
     
     Args:
@@ -525,9 +525,9 @@ def set_timeline_item_retime(timeline_item_id: str,
 @mcp.tool()
 @granular_destructive_op()
 def set_timeline_item_stabilization(timeline_item_id: str, 
-                                   enabled: bool = None, 
-                                   method: str = None,
-                                   strength: float = None) -> str:
+                                   enabled: Optional[bool] = None, 
+                                   method: Optional[str] = None,
+                                   strength: Optional[float] = None) -> str:
     """Set stabilization properties for a timeline item.
     
     Args:
@@ -617,9 +617,9 @@ def set_timeline_item_stabilization(timeline_item_id: str,
 @mcp.tool()
 @granular_destructive_op()
 def set_timeline_item_audio(timeline_item_id: str, 
-                           volume: float = None, 
-                           pan: float = None,
-                           eq_enabled: bool = None) -> str:
+                           volume: Optional[float] = None, 
+                           pan: Optional[float] = None,
+                           eq_enabled: Optional[bool] = None) -> str:
     """Set audio properties for a timeline item.
     
     Args:
@@ -716,7 +716,17 @@ def set_timeline_item_audio(timeline_item_id: str,
             
             return f"Successfully set {' and '.join(changes)} for timeline item '{timeline_item.GetName()}'"
         else:
-            return f"Failed to set some audio properties for timeline item '{timeline_item.GetName()}'"
+            return (
+                f"Failed to set audio properties for timeline item "
+                f"'{timeline_item.GetName()}'. Resolve's scripting API has no "
+                "write path for audio level, pan, or EQ — SetProperty covers "
+                "the video transform only, so 'Volume'/'Gain' return False and "
+                "'Pan' moves the video transform, not the audio pan. Work "
+                "around it by baking the gain into a rendered copy of the "
+                "source (ffmpeg volume=NdB) and importing that, or (Resolve "
+                "20.2.2+) by saving a Fairlight preset in the UI and applying "
+                "it with project_settings apply_fairlight_preset."
+            )
     except Exception as e:
         return f"Error setting timeline item audio properties: {str(e)}"
 
@@ -947,7 +957,7 @@ def add_keyframe(timeline_item_id: str, property_name: str, frame: int, value: f
 
 
 @mcp.tool()
-def modify_keyframe(timeline_item_id: str, property_name: str, frame: int, new_value: float = None, new_frame: int = None) -> str:
+def modify_keyframe(timeline_item_id: str, property_name: str, frame: int, new_value: Optional[float] = None, new_frame: Optional[int] = None) -> str:
     """Modify an existing keyframe by changing its value or frame position.
     
     Args:
@@ -1380,6 +1390,9 @@ def ti_set_property(property_name: str, property_value: Any, item_index: int = 0
         track_type: 'video' or 'audio'. Default: 'video'.
         track_index: 1-based track index. Default: 1.
     """
+    if track_type == "subtitle":
+        return {"success": False, "error": "SetProperty is unsupported on subtitle items. "
+                "Use advanced project_db write_captions / set_subtitle_preset with Resolve fully quit."}
     item, err = _get_timeline_item(track_type, track_index, item_index)
     if err:
         return err

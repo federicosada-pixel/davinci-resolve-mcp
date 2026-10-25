@@ -78,6 +78,27 @@ test('rename_plan REFUSES camera originals and flags collisions', () => {
   assert.equal(r.collisions, 2);
 });
 
+test('rename_plan flags a target a name in the set keeps', () => {
+  // The refusal protects the camera original; the plan must not then propose
+  // renaming another file onto it.
+  const r = renamePlan(['A001_C001.mov', 'dailies_A001_C001.mov'], { find: 'dailies_', replace: '' });
+  assert.equal(r.plan.find((p) => p.from === 'A001_C001.mov').action, 'refuse-camera-original');
+  assert.equal(r.plan.find((p) => p.from === 'dailies_A001_C001.mov').action, 'collision');
+  assert.equal(r.collisions, 1);
+  assert.equal(r.renameCount, 0);
+  // Same for a name the find leaves alone.
+  const n = renamePlan(['shot_b.mov', 'b.mov'], { find: 'shot_', replace: '' });
+  assert.equal(n.plan.find((p) => p.from === 'shot_b.mov').action, 'collision');
+  assert.equal(n.collisions, 1);
+});
+
+test('reel_normalize flags a reel already at its normalized name', () => {
+  const r = reelNormalize(['card1', 'CARD001']);
+  assert.equal(r.plan.find((p) => p.from === 'card1').action, 'collision');
+  assert.equal(r.collisions, 1);
+  assert.equal(r.normalizeCount, 0);
+});
+
 test('reel_normalize uppercases and zero-pads', () => {
   const r = reelNormalize(['a1', 'a02', 'B003']);
   assert.equal(r.plan.find((p) => p.from === 'a1').to, 'A001');

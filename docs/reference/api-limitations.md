@@ -12,7 +12,7 @@ that none exists).
 
 **Verified on:** DaVinci Resolve Studio 21.0.2
 
-**Totals:** 41 missing capabilities, 54 bugs / unreliable behaviors.
+**Totals:** 42 missing capabilities, 56 bugs / unreliable behaviors.
 
 The authoritative source is the runtime-queryable `api_truth` ledger
 (`resolve_control api_truth "<query>"`); this document is generated from
@@ -167,22 +167,22 @@ equivalent, blocking full automation.
 ### Per-subtitle text content and timing editing
 
 - **Object:** `TimelineItem (subtitle track)`
-- **Behavior:** TimelineItem on a subtitle track exposes only 21 standard transform/composite properties (Pan, Tilt, ZoomX, Opacity, Crop, etc.). There are no methods to get or set subtitle text (GetText/SetText), start time, end time, or duration for individual subtitle items. Subtitles created via CreateSubtitlesFromAudio or imported via the Resolve UI cannot have their content or timing read or modified programmatically. Verified via dir() and GetProperty() on Resolve 21.0.0.48.
-- **Workaround / current handling:** No workaround exists — subtitle text and timing are completely inaccessible from the scripting API. Must be edited in the Resolve UI.
+- **Behavior:** GetName, GetStart and GetEnd read caption names and bounds, and Timeline.DeleteClips can delete captions. There are no public methods to set caption text or per-word timings. Read-only live probe on Studio 21.1.0.17 (Windows, 2026-10-02): GetType=generator, GetProperty returned an empty dict, GetFusionCompCount=0, and dir() exposed no caption/text methods; the supplied reproduction also reports false GetProperty/SetProperty results. A subtitle SetProperty request must be refused before timeline auto-archiving. In the supplied 21.1 reproduction, UI text edits leave Name stale and move original AI words/times to protobuf f18/19/20; current f14/15/16 may contain invalid intervals. Whether a later save re-times them is not established here.
+- **Workaround / current handling:** Use advanced project_db list_captions / write_captions / check_captions on a local SQLite project with Resolve fully quit. Current text comes from f14, not stale Name. f15/16 and f19/20 use 60 ticks/sec; f21 is the original caption frame anchor. The tool returns timeline-frame times rebased to the item's current Start. Writes need explicit word times, preserve unknown fields, reject gaps/zero durations and re-index Items atomically, with backup and readback. This is an unsupported DB workaround; render/reopen validation of the implementation remains required before release.
 - **Tags:** missing-method, subtitle, text, timing
 
 ### Subtitle track styling and presets
 
 - **Object:** `TimelineItem / Timeline / Project`
-- **Behavior:** There is no API method to set or query subtitle font family, font size, text color, background color, outline, shadow, position, alignment, or to apply/query subtitle style presets. TimelineItem.GetProperty() on subtitle items returns only transform/composite keys. Timeline.GetSetting() and Project.GetSetting() return None for all probed subtitle-style keys (e.g. 'subtitleFontName', 'subtitleFontSize', 'subtitleTextColor', 'subtitleBackgroundColor', 'subtitlePosition', 'subtitleAlignment', 'subtitlePreset', 'subtitleStyle'). Verified via dir(), GetProperty(), and GetSetting() on Resolve 21.0.0.48.
-- **Workaround / current handling:** No API workaround exists, but the style IS reachable below the API: it lives in Sm2TiTrack.FieldsBlob for Type=2 tracks, as an EffectFiltersBA payload whose effect 136 carries a Qt QFont descriptor (param 18) and a normalised position vector (param 17). Exposed as project_db list_subtitle_styles / set_subtitle_style (font family/size/weight/italic + position). Confirmed live on BOTH editions 2026-08-06 — Studio 19.1.3 and free 21.0.3, identical behaviour: Resolve opens a patched track and re-serialises it back to its own zstd form with the patched values intact, so it genuinely parses the write. Caveats: whole-TRACK style not per-caption, project must be CLOSED, Resolve must be fully quit and relaunched afterwards, and the track must already carry a style blob (a freshly added subtitle track has none until it is styled once in the UI). Burn-in overlays via Fusion titles remain a visual alternative but do not produce subtitle tracks.
+- **Behavior:** There is no API method to set or query subtitle font family, font size, text color, background color, outline, shadow, position, alignment, or to apply/query subtitle style presets. Older probes returned only transform/composite keys; a read-only Studio 21.1.0.17 probe returned an empty dict. Timeline.GetSetting() and Project.GetSetting() return None for all probed subtitle-style keys (e.g. 'subtitleFontName', 'subtitleFontSize', 'subtitleTextColor', 'subtitleBackgroundColor', 'subtitlePosition', 'subtitleAlignment', 'subtitlePreset', 'subtitleStyle'). Verified via dir(), GetProperty(), and GetSetting() on Resolve 21.0.0.48.
+- **Workaround / current handling:** No API workaround exists, but the style IS reachable below the API: it lives in Sm2TiTrack.FieldsBlob for Type=2 tracks, as an EffectFiltersBA payload whose effect 136 carries a Qt QFont descriptor (param 18) and a normalised position vector (param 17). Exposed as project_db list_subtitle_styles / set_subtitle_style (font family/size/weight/italic + position). Confirmed live on BOTH editions 2026-08-06 — Studio 19.1.3 and free 21.0.3, identical behaviour: Resolve opens a patched track and re-serialises it back to its own zstd form with the patched values intact, so it genuinely parses the write. Caveats: whole-TRACK style not per-caption, project must be CLOSED, Resolve must be fully quit and relaunched afterwards, and the track must already carry a style blob (a freshly added subtitle track has none until it is styled once in the UI). Burn-in overlays via Fusion titles remain a visual alternative but do not produce subtitle tracks. Animated Word Highlight is DIFFERENT: list_subtitle_styles may report styled:false while an animation is present. Sm2TiItem_Sm2TiTrack links a Sm2TiVideoClip holder via FusionCompHolderItems to a Sm2TiCompositionTable. The supplied Studio 21.1.0.17 reproduction verified cloning these three rows; local read-only inspection corroborated the format. Use list_subtitle_presets / copy_subtitle_preset, or set_subtitle_preset for named Word Highlight inputs inside the nested zlib tool section. These new actions check that Resolve is fully quit BEFORE writing. Holder Duration is preserved; its rendering semantics and per-caption preset layouts remain unverified.
 - **Tags:** missing-method, subtitle, style, preset
 
 ### Speech recognition engine selection and SRT import
 
 - **Object:** `Timeline`
-- **Behavior:** Timeline.CreateSubtitlesFromAudio(autoCaptionSettings) always uses the built-in Resolve speech recognition engine. There is no API parameter to select an alternative provider (e.g. whisper-cli, Google Speech, AWS Transcribe). The language selection via resolve.AUTO_CAPTION_LANGUAGE_* is the only customization; the engine itself cannot be changed. Furthermore, there is no API method to import an SRT file into a subtitle track programmatically — File -> Import -> Subtitle is UI-only.
-- **Workaround / current handling:** No workaround exists for provider selection or SRT import. External transcripts must be converted to SRT and imported through the Resolve UI.
+- **Behavior:** Timeline.CreateSubtitlesFromAudio(autoCaptionSettings) always uses the built-in Resolve speech recognition engine. There is no API parameter to select an alternative provider (e.g. whisper-cli, Google Speech, AWS Transcribe). The language selection via resolve.AUTO_CAPTION_LANGUAGE_* is the only customization; the engine itself cannot be changed. There is no dedicated subtitle import method. However, MediaPool.ImportMedia(srt) + AppendToTimeline was reported working on Studio 21.0.4.5 (issue #169). Whether that route carries word timing for animated presets on 21.1 has not been verified; SRT contains only cue timing.
+- **Workaround / current handling:** Use Resolve's engine for CreateSubtitlesFromAudio. For external SRT, test ImportMedia + AppendToTimeline on the exact installed build or import through the UI. Use project_db write_captions for explicit word timings with Resolve fully quit; do not assume SRT supplies them.
 - **Tags:** missing-method, subtitle, transcription, speech-recognition, asr
 
 ### Media Pool folder rename
@@ -254,6 +254,15 @@ equivalent, blocking full automation.
 - **Behavior:** Some render formats expose NO codecs at all, and the call then rejects every codec value — the empty string, the format id itself, and any plausible name ('Linear PCM'). Which formats are affected varies by build: 'wav' and 'gif' on Studio 19.1.3.7; 'braw', 'mts' and 'wav' on 21.0.4.5 (gif gained codecs, BRAW and MTS lost them). 'wav' is affected on both, so there is no documented way to select it through this API and an audio-only WAV deliverable is not expressible in scripting.
 - **Workaround / current handling:** Check GetRenderCodecs(format) first; when it is empty, treat the format as unreachable through this API rather than guessing a codec value. Render audio-only via ExportVideo=False on a format that does expose codecs, or drive it from a saved render preset.
 - **Tags:** render, deliver, audio, unsupported
+
+### Project.AddRenderJob (the only readback for render settings)
+
+- **Object:** `Project`
+- **Signature:** `() -> str`
+- **Behavior:** There is no GetRenderSettings, but a queued job carries the settings it inherited. Measured 2026-09-30 on Studio 19.1.3.7: after AddRenderJob, the matching GetRenderJobList entry reports TargetDir, OutputFilename (the custom name, or the timeline name when none was ever set, plus the format's extension), MarkIn/MarkOut, VideoFormat/VideoCodec, RenderMode and PresetName, and DeleteRenderJob removes it. The round trip took about 150 ms and switches Resolve to the Deliver page. Queuing two identical jobs, or a job whose output file already exists, raised no dialog and returned distinct ids. Limits: AddRenderJob returns '' when no TargetDir has ever been set, and also in Individual-clips mode on a generator-only timeline, so neither state can be read this way. Once set, TargetDir cannot be cleared — SetRenderSettings returns False for '' and for None — though a TargetDir that does not exist is accepted. CustomName has no direct readback: it is only visible folded into OutputFilename.
+- **Workaround / current handling:** To preserve a user's output folder across work that has to change it: in single-clip mode, queue a job, read TargetDir off its entry, delete the job, and write TargetDir back afterwards. Leave CustomName alone wherever possible — it can be neither read nor cleared; render into a private folder and take the file that appears instead of naming it.
+- **Reference:** [issue #270](https://github.com/samuelgursky/davinci-resolve-mcp/issues/270)
+- **Tags:** render, deliver, readback, unsupported
 
 ### TimelineItem.SetCDL (write-only — no GetCDL anywhere)
 
@@ -688,6 +697,24 @@ values, or automation-hostile modal prompts.
 - **Workaround / current handling:** Pin the base state instead of inheriting one — prepare_render_job(from_preset='<a video preset>') runs LoadRenderPreset before the explicit settings go on top (PresetName flips to 'Custom' once they do, which is expected). Then verify the OUTPUT, not the job: ffprobe for a codec_type=video stream. A long timeline that completes in seconds is the tell.
 - **Reference:** [issue #123](https://github.com/samuelgursky/davinci-resolve-mcp/issues/123)
 - **Tags:** render, deliver, silent-failure, preset, readback-lies
+
+### Project.GetCurrentRenderMode (switches to the Deliver page)
+
+- **Object:** `Project`
+- **Signature:** `() -> int`
+- **Behavior:** A getter with a side effect: calling it switches Resolve to the Deliver page. Measured 2026-09-30 on Studio 19.1.3.7 from the Edit, Color and Fairlight pages: GetCurrentPage() read 'deliver' immediately afterwards, every time. The other render readers do not do this — GetCurrentRenderFormatAndCodec, GetRenderFormats, GetRenderCodecs, GetRenderResolutions, GetRenderJobList, GetRenderPresetList, IsRenderingInProgress and Timeline.GetMarkInOut all left the page alone in the same run. The render WRITERS all switch: SetCurrentRenderMode, SetCurrentRenderFormatAndCodec, SetRenderSettings, AddRenderJob and StartRendering each moved Edit to Deliver; DeleteRenderJob did not. Nothing switches back on its own. Issue #270 reported the consequence on Studio 21.1.0.17 — a frame capture that left the user on Deliver — but the per-call measurement was not repeated on that build.
+- **Workaround / current handling:** Read GetCurrentPage() BEFORE the first render call, not after, and OpenPage back when done. A page read after GetCurrentRenderMode is always 'deliver', which makes a restore look unnecessary — that ordering is how the capture stranded users. src/utils/page_lock.py:restoring_page reads first, restores after, and reads the page back to confirm.
+- **Reference:** [issue #270](https://github.com/samuelgursky/davinci-resolve-mcp/issues/270)
+- **Tags:** render, deliver, page, side-effect, getter
+
+### Project.SetRenderSettings (an empty CustomName rejects the whole payload)
+
+- **Object:** `Project`
+- **Signature:** `({settings}) -> bool`
+- **Behavior:** SetRenderSettings returns False for {'CustomName': ''} and for {'CustomName': None}, and when that key rides in a larger payload the WHOLE payload is rejected, not just the name. Measured 2026-09-30 on Studio 19.1.3.7: with the render range pinned to one frame, {SelectAllFrames: True, MarkIn: start, MarkOut: end, CustomName: ''} returned False and a job added afterwards still carried MarkIn == MarkOut == the pinned frame; the same payload without CustomName returned True and the job carried the whole timeline. A single space IS accepted, and becomes the file name. So a custom name, once set, cannot be cleared through this API, and there is no GetRenderSettings to read the previous one back from.
+- **Workaround / current handling:** Never send an empty CustomName, and never bundle a best-effort key with keys that matter: send each setting in its own payload and check its return. Better, do not write CustomName at all when the name is not yours to keep. To see what a job will inherit, AddRenderJob, read MarkIn/MarkOut/TargetDir/OutputFilename off GetRenderJobList, then DeleteRenderJob.
+- **Reference:** [issue #270](https://github.com/samuelgursky/davinci-resolve-mcp/issues/270)
+- **Tags:** render, deliver, silent-failure, unreliable-return
 
 ### ProjectManager.SaveProject
 

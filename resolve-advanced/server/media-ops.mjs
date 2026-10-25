@@ -133,19 +133,18 @@ export function renamePlan(names, rule = {}) {
   const camRe = rule.cameraOriginalRe || CAMERA_ORIGINAL_RE;
   const plan = [];
   const targets = new Map();
+  // A name the plan leaves in place still occupies it — a refused camera original
+  // above all — so it counts as a target too, or a rename onto it reads as free.
   for (const name of names) {
     const isCam = camRe.test(name);
     if (isCam && !rule.allowCameraOriginals) {
       plan.push({ from: name, action: 'refuse-camera-original', note: 'camera original — rename via sidecar/DB only, never the file' });
+      targets.set(name, (targets.get(name) || 0) + 1);
       continue;
     }
     const to = name.replace(re, rule.replace ?? '');
-    if (to === name) {
-      plan.push({ from: name, to, action: 'noop' });
-      continue;
-    }
     targets.set(to, (targets.get(to) || 0) + 1);
-    plan.push({ from: name, to, action: 'rename' });
+    plan.push({ from: name, to, action: to === name ? 'noop' : 'rename' });
   }
   // Flag collisions (two sources → one target).
   for (const p of plan) if (p.action === 'rename' && targets.get(p.to) > 1) p.action = 'collision';
@@ -168,7 +167,7 @@ export function reelNormalize(reels, opts = {}) {
     const to = String(r)
       .toUpperCase()
       .replace(/(\d+)\s*$/, (m) => m.padStart(pad, '0'));
-    if (to !== r) targets.set(to, (targets.get(to) || 0) + 1);
+    targets.set(to, (targets.get(to) || 0) + 1);
     plan.push({ from: r, to, action: to === r ? 'noop' : 'normalize' });
   }
   for (const p of plan) if (p.action === 'normalize' && targets.get(p.to) > 1) p.action = 'collision';
