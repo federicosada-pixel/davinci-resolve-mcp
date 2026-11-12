@@ -22,7 +22,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "adm-zip": "^0.6.0",
-    "fast-xml-parser": "^5.11.1",
+    "fast-xml-parser": "^5.12.0",
     "fzstd": "^0.1.1",
     "jszip": "^3.10.1",
     "zod": "^4.5.4",
