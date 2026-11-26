@@ -140,3 +140,4 @@ handshake.jsonl
 # Local recovery indexes and analyzer reports.
 tools/file-analyzer/reports/
 tools/ableton-recovery/data/
+.serena/
